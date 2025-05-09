@@ -32,35 +32,87 @@ import cv2
 import numpy as np
 import arcpy
 import subprocess
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.config_loader import resolve_config
-from utils.path_utils import get_log_path
+from utils.path_utils import get_log_path, get_image_base_path, get_enhancement_profile_path
 from utils.arcpy_utils import log_message
 from utils.check_disk_space import check_sufficient_disk_space
+from utils.openai_utils import ask_chatgpt
+from utils.generate_anchor_profile import run_profile_generation
+from utils.image_stats import compute_image_stats
 
 
-def compute_image_stats(img):
+def chatgpt_adjustments(pre_stats, post_stats, config=None, messages=None):
     """
-    Calculates the brightness and contrast of an image.
-    
-    The image is converted to grayscale before computing the mean (brightness) and standard deviation (contrast) of
-    pixel intensities.
-    
+    Asks ChatGPT for enhancement parameter suggestions based on pre/post stats.
+
     Args:
-    	img: Input image as a NumPy array in BGR color format.
-    
+        pre_stats (dict): Dict with brightness, contrast, saturation before enhancement.
+        post_stats (dict): Dict with same fields after enhancement.
+        config (dict): Full config with OpenAI settings.
+        messages (list): Optional logger.
+
     Returns:
-    	A tuple containing the brightness (float) and contrast (float) of the image.
+        dict | None: Suggested config with gamma, clahe_clip, saturation_boost
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    brightness = np.mean(gray)
-    contrast = np.std(gray)
-    return brightness, contrast
+    ai_assist = config.get("image_enhancement", {}).get("ai_assist", False)
+    if not ai_assist:
+        return None
+    prompt = (
+        "Here are image stats before and after enhancement:\n"
+        f"Before: brightness={pre_stats['brightness']:.2f}, contrast={pre_stats['contrast']:.2f}, saturation={pre_stats['saturation']:.2f}\n"
+        f"After: brightness={post_stats['brightness']:.2f}, contrast={post_stats['contrast']:.2f}, saturation={post_stats['saturation']:.2f}\n"
+        "Target brightness: ~110, Target contrast: 45-50, Target saturation: ~60.\n"
+        "Suggest whether to adjust gamma, CLAHE clip limit, or saturation to improve consistency.\n"
+        "Return ONLY a valid JSON object with keys: 'gamma', 'clahe_clip', 'saturation_boost'."
+    )
+    return ask_chatgpt(prompt, config, messages)
 
 
+# === Seam-aware Enhancement ===
+def wrap_horizontal(img, wrap_size=64):
+    left = img[:, -wrap_size:]
+    right = img[:, :wrap_size]
+    return np.concatenate([left, img, right], axis=1)
+
+
+def unwrap_horizontal(img, wrap_size=64):
+    return img[:, wrap_size:-wrap_size]
+
+
+def enhance_image_seam_aware(img, enhance_config, contrast, full_config=None, messages=None, wrap_size=64):
+    wrapped = wrap_horizontal(img, wrap_size=wrap_size)
+    enhanced_wrapped, clip_limit_used, methods_applied, stats = enhance_image(
+        wrapped, enhance_config, contrast, full_config=full_config, messages=messages
+    )
+    enhanced = unwrap_horizontal(enhanced_wrapped, wrap_size=wrap_size)
+    return enhanced, clip_limit_used, methods_applied, stats
+
+
+def load_enhancement_profile(profile_path):
+    with open(profile_path, "r") as f:
+        return json.load(f)
+
+def interpolate_settings(image_name, profile, fallback):
+    keys = sorted(profile.keys())
+    if image_name in profile:
+        return profile[image_name]
+    try:
+        index = keys.index(image_name)
+    except ValueError:
+        return fallback
+    before = max(0, index - 1)
+    after = min(len(keys) - 1, index + 1)
+    k1, k2 = keys[before], keys[after]
+    s1, s2 = profile[k1], profile[k2]
+    return {k: (s1.get(k, 0) + s2.get(k, 0)) / 2 for k in s1}
+
+
+# === Main Image Enhancement ===
 def apply_white_balance(img, method="gray_world"):
     """
     Applies white balance correction to an image using the specified method.
@@ -309,7 +361,7 @@ def write_log(log_rows, config, messages=None):
 
 
 def enhance_single_image(original_path: Path, enhance_config, config, output_mode, suffix, original_tag, enhanced_tag,
-                         messages):
+                         messages, dry_run=False):
     """
     Enhances a single image file and writes the result to disk, handling output path logic and EXIF metadata copying.
 
@@ -339,10 +391,53 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
     if img is None:
         return None, f"⚠️ Skipping unreadable image: {original_path}"
 
-    brightness, contrast = compute_image_stats(img)
-    enhanced, clip_limit, methods, stats = enhance_image(img, enhance_config, contrast, full_config=config,
-                                                         messages=messages)
+    stats = compute_image_stats(img)
+    brightness = stats["brightness"]
+    contrast = stats["contrast"]
+    saturation = stats["saturation"]
 
+    # Load profile and enhance
+    profile_path = get_enhancement_profile_path(config)
+    if profile_path and Path(profile_path).exists():
+        profile = load_enhancement_profile(profile_path)
+        image_name = original_path.name
+        dynamic_config = interpolate_settings(image_name, profile, enhance_config)
+    else:
+        dynamic_config = enhance_config
+
+    enhanced, clip_limit, methods, stats = enhance_image_seam_aware(img, dynamic_config, contrast, full_config=config,
+                                                                    messages=messages)
+
+    # Track pre-enhancement stats explicitly
+    stats["brightness_before"] = brightness
+    stats["contrast_before"] = contrast
+    stats["saturation_before"] = saturation
+
+    # After enhancement, compute saturation again
+    hsv_after = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    stats["saturation_after"] = float(np.mean(hsv_after[:, :, 1]))
+
+    # Post-analysis and retry if needed
+    pre_stats = {
+        "brightness": stats["brightness_before"],
+        "contrast": stats["contrast_before"],
+        "saturation": stats["saturation_before"]
+    }
+    post_stats = {
+        "brightness": stats["brightness_after"],
+        "contrast": stats["contrast_after"],
+        "saturation": stats["saturation_after"]
+    }
+    suggestion = chatgpt_adjustments(pre_stats, post_stats, config=config, messages=messages)
+    if suggestion:
+        dynamic_config["clahe"] = {"clip_limit_low": suggestion.get("clahe_clip", 2.0)}
+        dynamic_config["saturation_boost"] = {"factor": suggestion.get("saturation_boost", 1.1)}
+        enhanced, clip_limit, methods, stats = enhance_image_seam_aware(img, dynamic_config, contrast,
+                                                                        full_config=config, messages=messages)
+        hsv_after = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+        stats["saturation_after"] = float(np.mean(hsv_after[:, :, 1]))
+
+    # Output path resolution
     if output_mode == "overwrite":
         out_path = original_path
     elif output_mode == "suffix":
@@ -359,28 +454,34 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
     else:
         return None, f"❌ Unknown output_mode: '{output_mode}'. Expected one of: overwrite, suffix, directory"
 
-    try:
-        if not cv2.imwrite(str(out_path), enhanced):
-            return None, f"❌ cv2 failed to write image to {out_path}"
-        # ✅ Copy EXIF metadata from original to enhanced image
-        exiftool_path = config.get("executables", {}).get("exiftool", {}).get("exe_path", "exiftool")
-        copied = copy_exif_metadata(original_path, out_path, exiftool_path)
-        if not copied:
-            log_message(f"⚠️ Failed to copy EXIF metadata from {original_path.name}", messages, level="warning",
-                        config=config)
-    except Exception as e:
-        return None, f"❌ Failed to write image to {out_path}: {e}"
+    if not dry_run:
+        try:
+            if not cv2.imwrite(str(out_path), enhanced):
+                return None, f"❌ cv2 failed to write image to {out_path}"
+            # ✅ Copy EXIF metadata from original to enhanced image
+            exiftool_path = config.get("executables", {}).get("exiftool", {}).get("exe_path", "exiftool")
+            copied = copy_exif_metadata(original_path, out_path, exiftool_path)
+            if not copied:
+                log_message(f"⚠️ Failed to copy EXIF metadata from {original_path.name}", messages, level="warning",
+                            config=config)
+        except Exception as e:
+            return None, f"❌ Failed to write image to {out_path}: {e}"
+    else:
+        log_message(f"[Dry Run] Would write: {out_path}", messages, config=config)
+        copied = True  # assume success for log row
 
     log_row = [
         original_path.name,
         round(stats["brightness_before"], 2),
         round(stats["contrast_before"], 2),
+        round(stats.get("saturation_before", 0.0), 2),
         clip_limit or "",
         methods["white_balance"] or "no",
         "yes" if methods["clahe"] else "no",
         "yes" if methods["sharpen"] else "no",
         round(stats["brightness_after"], 2),
         round(stats["contrast_after"], 2),
+        round(stats.get("saturation_after", 0.0), 2),
         f"{stats['pre_rgb_means']}" if stats["pre_rgb_means"] else "",
         f"{stats['post_rgb_means']}" if stats["post_rgb_means"] else "",
         str(out_path)
@@ -393,7 +494,7 @@ def enhance_images_in_oid(
     config: Optional[dict] = None,
     config_file: Optional[str] = None,
     messages=None
-):
+)-> Dict[str, str]:
 
     """
     Enhances all images referenced in an ArcGIS ObjectID feature class using configurable image processing steps.
@@ -425,17 +526,42 @@ def enhance_images_in_oid(
         log_message("Image enhancement is disabled in config. Skipping...", messages, config=config)
         return {}
 
-    check_sufficient_disk_space(oid_fc=oid_fc_path, config=config, buffer_ratio=1.1, verbose=True, messages=messages)
+    enh_config = config.get("image_enhancement", {})
+    dry_run = enh_config.get("dry_run", False)
+    output_mode = enh_config.get("output", {}).get("mode", {})
+    suffix = enh_config.get("output", {}).get("suffix", "_enh")
+    folders = config.get("image_output", {}).get("folders", {})
+    original_tag = folders.get("original", "original")
+    enhanced_tag = folders.get("enhanced", "enhanced")
 
-    enhance_config = config["image_enhancement"]
-    output_mode = enhance_config["output"]["mode"]
-    suffix = enhance_config["output"].get("suffix", "_enh")
-    folders = config["image_output"]["folders"]
-    original_tag = folders["original"]
-    enhanced_tag = folders["enhanced"]
+    check_sufficient_disk_space(oid_fc=oid_fc_path, folder_key=original_tag, config=config, buffer_ratio=1.1,
+                                verbose=True, messages=messages)
 
     with arcpy.da.SearchCursor(oid_fc_path, ["ImagePath"]) as cursor:
         paths = [Path(row[0]) for row in cursor]
+
+    # Auto-generate enhancement profile if needed
+    profile_path = get_enhancement_profile_path(config)
+    auto_generate = enh_config.get("auto_generate_profile", False)
+
+    sample_image_path = str(paths[0])
+    image_dir = get_image_base_path(sample_image_path, original_tag, config, messages)
+    if not image_dir:
+        log_message("⚠️ Skipping auto-generation due to unresolved image directory.", messages, level="warning",
+                    config=config)
+        return {}
+
+    if auto_generate and profile_path and not Path(profile_path).exists():
+        log_message(f"📁 Enhancement profile not found at {profile_path}. Auto-generating from anchor frames...",
+                    messages, config=config)
+        run_profile_generation(image_dir=image_dir, config=config, messages=messages)
+
+    if not auto_generate:
+        log_message("ℹ️ Auto-generation of enhancement profile is disabled in config.", messages, config=config)
+
+    if Path(profile_path).exists():
+        log_message("✅ Enhancement profile found and will be used as-is.", messages, config=config)
+
 
     total = len(paths)
     use_progressor = False
@@ -453,15 +579,15 @@ def enhance_images_in_oid(
     contrast_deltas = []
     failed_exif_copies = []
 
-    max_workers = enhance_config.get("max_workers")
+    max_workers = enh_config.get("max_workers")
     if not max_workers:
         cpu_cores = os.cpu_count() or 8
         max_workers = max(4, int(cpu_cores * 0.75))
 
     with ThreadPoolExecutor(max_workers) as executor:
         futures = [
-            executor.submit(enhance_single_image, p, enhance_config, config, output_mode, suffix, original_tag,
-                            enhanced_tag, messages)
+            executor.submit(enhance_single_image, p, enh_config, config, output_mode, suffix, original_tag,
+                            enhanced_tag, messages, dry_run=dry_run)
             for p in paths
         ]
         for idx, future in enumerate(as_completed(futures), start=1):
@@ -480,8 +606,8 @@ def enhance_images_in_oid(
             # Collect deltas for summary stats
             b_before = float(log_row[1])
             c_before = float(log_row[2])
-            b_after = float(log_row[7])
-            c_after = float(log_row[8])
+            b_after = float(log_row[8])
+            c_after = float(log_row[9])
             brightness_deltas.append(b_after - b_before)
             contrast_deltas.append(c_after - c_before)
 
@@ -515,6 +641,9 @@ def enhance_images_in_oid(
         mean_contrast_delta = np.mean(contrast_deltas)
         log_message(f"📊 Avg Brightness Δ: {mean_bright_delta:.2f} | Avg Contrast Δ: {mean_contrast_delta:.2f}",
                     messages, config=config)
+
+    if dry_run:
+        log_message("✅ Dry run complete. No images or metadata were written.", messages, config=config)
 
     return path_map
 

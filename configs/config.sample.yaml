@@ -5,7 +5,7 @@
 #
 # schema_version (str): Defines which config format version this file conforms to.
 # Used for future validation and compatibility checks.
-schema_version: 1.0.0  # Pre-release schema version (non-enforced)
+schema_version: 1.0.1
 debug_messages: false
 
 # ------------------------------------------------------------------------------
@@ -682,8 +682,13 @@ geocoding:
 # --------------------------------------------------------------------
 image_enhancement:
   enabled: true               # Master switch for image enhancement
+  dry_run: false
   adaptive: true              # Enable adaptive tuning for CLAHE
   max_workers: 16             # For high throughput without overloading
+  auto_generate_profile: true
+  profile_json: "enhancement_profile.json"
+  ai_assist: true
+  interval: 100
 
   # ----------------------------------------------------------------
   # 🗂️ OUTPUT MODE
@@ -781,3 +786,12 @@ orchestrator:
   # Location of the shared backup geodatabase where OID snapshots will be stored.
   # Backups are named like: OID_before_{step}_{timestamp}
   oid_backup_fgdb: "backups/oid_snapshots.gdb"
+
+# ----------------------------------------------------------------
+# OPENAI CONFIG
+# ----------------------------------------------------------------
+openai:
+  keyring_openai: false
+  keyring_service_name: rmi_openai
+  api_key: <OPENAI API-KEY>
+  model: "gpt-4o"

@@ -35,7 +35,7 @@ from utils.arcpy_utils import log_message
 from utils.expression_utils import load_field_registry, resolve_expression
 from utils.path_resolver import resolve_relative_to_pyt
 
-SUPPORTED_SCHEMA_VERSIONS = {"1.0.0"}
+SUPPORTED_SCHEMA_VERSIONS = {"1.0.1"}
 
 
 class ConfigValidationError(Exception):

@@ -14,7 +14,7 @@
 #
 # File Location:        /utils/check_disk_space.py
 # Called By:            tools/enhance_images_tool.py, tools/rename_images_tool.py
-# Int. Dependencies:    arcpy_utils
+# Int. Dependencies:    arcpy_utils, path_utils
 # Ext. Dependencies:    arcpy, os, shutil
 #
 # Documentation:
@@ -29,31 +29,38 @@ import arcpy
 import os
 import shutil
 from utils.arcpy_utils import log_message
+from utils.path_utils import get_image_folder_path
 
 
-def check_sufficient_disk_space(oid_fc, config=None, buffer_ratio=1.1, verbose=False, messages=None):
+def check_sufficient_disk_space(oid_fc, folder_key, config=None, buffer_ratio=1.1, verbose=False, messages=None):
     """
-    Checks if sufficient disk space is available for image operations on an Oriented Imagery Dataset.
-    
-    Estimates the required disk space by calculating the size of the relevant 'original' or 'enhanced' image directory
-    and applying a safety buffer. Raises an error if the available space on the drive is less than the estimated
-    requirement.
-    
+    Checks if sufficient disk space is available for image processing using a representative folder
+    (e.g., 'original', 'enhanced') derived from the OID ImagePath field.
+
+    This function:
+    - Retrieves a sample image path from the OID feature class
+    - Resolves the configured image folder base (e.g., 'original') using the path and config
+    - Estimates total folder size recursively and applies a safety buffer
+    - Compares the required space against available disk space on the corresponding drive
+
     Args:
-        oid_fc: Path to the Oriented Imagery Dataset feature class.
-        config: Optional configuration dictionary that may specify disk space settings and folder names.
-        buffer_ratio: Safety multiplier applied to the estimated required space. Defaults to 1.1.
-        verbose: If True, logs detailed messages.
-        messages: Optional ArcGIS Pro message interface or None for CLI.
-    
+        oid_fc (str): Path to the Oriented Imagery Dataset feature class (must include 'ImagePath' field).
+        folder_key (str): Key to the configured image folder in config['image_output']['folders'],
+                          typically 'original' or 'enhanced'.
+        config (dict, optional): Full resolved configuration dictionary.
+        buffer_ratio (float, optional): Safety multiplier applied to estimated size. Default is 1.1.
+        verbose (bool, optional): If True, logs folder and size details.
+        messages (list, optional): ArcGIS message interface or CLI-compatible logger.
+
     Raises:
-        ValueError: If no valid image path is found or if the image path does not include expected folder names.
-        FileNotFoundError: If the base image directory does not exist.
-        RuntimeError: If available disk space is insufficient.
-    
+        ValueError: If no valid image path is found or the target folder cannot be resolved.
+        FileNotFoundError: If the resolved folder path does not exist.
+        RuntimeError: If available disk space is insufficient for the estimated need.
+
     Returns:
-        True if sufficient disk space is available.
+        bool: True if sufficient space is available; False if an early failure condition is met.
     """
+
 
     if config is None:
         config = {}
@@ -74,26 +81,13 @@ def check_sufficient_disk_space(oid_fc, config=None, buffer_ratio=1.1, verbose=F
     if not image_path:
         log_message("No valid ImagePath found in the OID feature class.", messages, level="error",
                     error_type=ValueError, config=config)
+        return False
 
-    # Determine target folder from ImagePath
-    target_dir = os.path.dirname(image_path)
-    drive_root = os.path.splitdrive(target_dir)[0] + os.sep
-
-    # Get folder names from config
-    img_folders = config.get("image_output", {}).get("folders", {})
-    original_folder = img_folders.get("original", "original").lower()
-    enhanced_folder = img_folders.get("enhanced", "enhanced").lower()
-
-    # Identify which folder we're in (preserving case but allowing case-insensitive match)
-    def _find_base(d: str, token: str) -> str | None:
-        idx = d.lower().find(token.lower())
-        return d[: idx + len(token)] if idx != -1 else None
-
-    base_dir = _find_base(target_dir, original_folder) or _find_base(target_dir, enhanced_folder)
-
+    base_dir, drive_root = get_image_folder_path(sample_path=image_path, folder_key=folder_key, config=config, messages=messages)
     if not base_dir:
-        log_message(f"ImagePath does not include '{original_folder}' or '{enhanced_folder}' folder.", messages,
+        log_message(f"❌ Could not locate folder '{folder_key}' in the image path.", messages,
                     level="error", error_type=ValueError, config=config)
+        return False
 
     if not os.path.exists(base_dir):
         log_message(f"Base folder not found: {base_dir}", messages, level="error", error_type=FileNotFoundError,

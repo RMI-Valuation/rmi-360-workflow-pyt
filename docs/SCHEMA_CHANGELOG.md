@@ -4,6 +4,11 @@
 This changelog tracks structural changes to the Oriented Imagery Dataset (OID) schema, the `config.yaml` layout, and the field registry.
 
 ---
+## [1.0.1] - 2025-05-09
+- Added support for `openai`
+  - `api_key`
+  - `ai_assist_img_enh.enabled`
+
 
 ## [1.0.0] – 2025-05-08
 

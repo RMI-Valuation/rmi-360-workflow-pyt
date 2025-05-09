@@ -34,7 +34,7 @@ from typing import Any, Optional, NoReturn
 from utils.validate_config import validate_full_config, validate_tool_config
 from utils.arcpy_utils import log_message, infer_project_root_from_oid
 
-EXPECTED_SCHEMA_VERSION = "1.0.0"  # Update this when schema changes significantly
+EXPECTED_SCHEMA_VERSION = "1.0.1"  # Update this when schema changes significantly
 CONFIG_CACHE: Optional[dict[str, Any]] = None
 
 

@@ -86,7 +86,9 @@ def rename_images(
     validate_fields_exist(oid_fc, [f for f in required_fields if f != "OID@"])
     fields = list(dict.fromkeys(required_fields))
 
-    check_sufficient_disk_space(oid_fc=oid_fc, config=config, buffer_ratio=1.1, verbose=True, messages=messages)
+    folder_key = folders.get("enhanced")
+    check_sufficient_disk_space(oid_fc=oid_fc, folder_key=folder_key, config=config, buffer_ratio=1.1, verbose=True,
+                                messages=messages)
 
     # Prepare output folder
     try:

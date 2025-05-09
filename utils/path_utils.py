@@ -27,6 +27,8 @@
 
 import os
 from typing import Optional
+from os.path import splitdrive
+from pathlib import Path
 from utils.expression_utils import resolve_expression
 
 
@@ -80,3 +82,59 @@ def get_log_path(log_key: str, config: dict) -> str:
         raise ValueError(f"Failed to create log directory '{log_dir}'. {e}") from e
 
     return os.path.join(log_dir, log_file)
+
+
+def get_image_folder_path(
+        sample_path: str,
+        folder_key: str,
+        config: dict,
+        messages=None) -> tuple[str, str] | tuple[None, None]:
+    """
+    Resolves the base path to the configured image folder (e.g., 'original', 'enhanced')
+    by inspecting the provided image path.
+
+    Args:
+        sample_path (str): Path to an image (or directory containing images).
+        folder_key (str): Key in config.image_output.folders (e.g., 'original', 'enhanced').
+        config (dict): Full resolved config dictionary.
+        messages (list): Optional logger for warnings or errors.
+
+    Returns:
+        (base_path, drive_root): Tuple of full folder path and its drive root.
+    """
+    def _find_base(path: str, token: str) -> Optional[str]:
+        idx = path.lower().find(token.lower())
+        return path[: idx + len(token)] if idx != -1 else None
+
+    img_folders = config.get("image_output", {}).get("folders", {})
+    target_token = img_folders.get(folder_key, folder_key)
+
+    # Try direct path match first
+    base_path = _find_base(sample_path, target_token)
+    if base_path and os.path.exists(base_path):
+        drive_root = splitdrive(base_path)[0] + os.sep
+        return base_path, drive_root
+
+    # Fallback: scan from drive root
+    drive_root = splitdrive(sample_path)[0] + os.sep
+    if os.path.exists(drive_root):
+        for root, dirs, _ in os.walk(drive_root):
+            for d in dirs:
+                if d.lower() == target_token.lower():
+                    fallback_path = os.path.join(root, d)
+                    return fallback_path, drive_root
+
+    if messages is not None:
+        messages.append(f"❌ Could not resolve path to '{folder_key}' folder from {sample_path}")
+
+    return None, None
+
+
+def get_image_base_path(sample_path, folder_key, config, messages=None):
+    base_path, _ = get_image_folder_path(sample_path, folder_key, config, messages)
+    return base_path
+
+
+def get_enhancement_profile_path(config: dict) -> Path:
+    filename = config.get("image_enhancement", {}).get("profile_json", "enhancement_profile.json")
+    return Path(config.get("__project_root__", ".")) / filename
