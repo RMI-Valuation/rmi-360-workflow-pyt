@@ -3,9 +3,10 @@
 # -----------------------------------------------------------------------------
 # Purpose:             Deploys Lambda functions and schedules upload monitor for 360° image tracking
 # Project:             RMI 360 Imaging Workflow Python Toolbox
-# Version:             1.0.0
+# Version:             1.1.0
 # Author:              RMI Valuation, LLC
-# Created:             2025-05-08
+# Created:             2025-05-13
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Deploys and configures AWS Lambda functions for monitoring upload progress to S3. Sets up a CloudWatch
@@ -13,12 +14,14 @@
 #   JSON file and verifies credentials via boto3. Uses keyring or fallback credentials defined in the config.
 #
 # File Location:        /utils/deploy_lambda_monitor.py
+# Validator:            /utils/validators/deploy_lambda_monitor_validator.py
 # Called By:            tools/copy_to_aws_tool.py, tools/process_360_orchestrator.py
-# Int. Dependencies:    config_loader, expression_utils, arcpy_utils, aws_utils, path_resolver
-# Ext. Dependencies:    boto3, botocore, json, zipfile, io, contextlib, datetime, typing
+# Int. Dependencies:    utils/manager/config_manager, utils/shared/expression_utils, utils/shared/aws_utils
+# Ext. Dependencies:    boto3, json, zipfile, io, contextlib, datetime, pathlib
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md, docs/tools/copy_to_aws.md, and AWS_SETUP_GUIDE.md
+#   See: docs_legacy/TOOL_GUIDES.md, docs_legacy/tools/copy_to_aws.md, and AWS_SETUP_GUIDE.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Notes:
 #   - Deploys both progress monitor and auto-disable Lambda functions
@@ -31,21 +34,13 @@ import json
 import zipfile
 import io
 import contextlib
-from typing import Optional, Any
 from datetime import datetime, timezone
 from pathlib import Path
 from boto3 import Session
 
-from utils.expression_utils import resolve_expression
-from utils.arcpy_utils import log_message
-from utils.path_resolver import resolve_relative_to_pyt
-from utils.config_loader import resolve_config
-from utils.aws_utils import get_aws_credentials
-
-# -- Constants for source files --
-# Defer resolution until inside main()
-PROGRESS_MONITOR_REL_PATH = "aws_lambdas/lambda_progress_monitor.py"
-DEACTIVATOR_REL_PATH = "aws_lambdas/disable_rule.py"
+from utils.manager.config_manager import ConfigManager
+from utils.shared.expression_utils import resolve_expression
+from utils.shared.aws_utils import get_aws_credentials
 
 
 def zip_lambda(source_path: str, arcname: str) -> bytes:
@@ -65,7 +60,7 @@ def zip_lambda(source_path: str, arcname: str) -> bytes:
     path = Path(source_path)
 
     if not path.is_file():
-        raise FileNotFoundError(f"Lambda file not found: {path}")
+        logger.error(f"Lambda file not found: {path}", error_type=FileNotFoundError, indent=2)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -75,77 +70,64 @@ def zip_lambda(source_path: str, arcname: str) -> bytes:
     return buf.read()
 
 
-def count_final_images(config):
+def get_final_image_files(final_folder):
+    """
+    Returns a list of JPEG image files in the given folder (recursively).
+    """
+    if not final_folder.exists():
+        return []
+    return [f for f in final_folder.rglob("*") if f.suffix.lower() in [".jpg", ".jpeg"]]
+
+def count_final_images(cfg):
     """
     Counts the number of JPEG images in the final output folder specified by the config.
-    
-    Raises:
-        ValueError: If the project root is missing from the config.
     
     Returns:
         The number of `.jpg` files found in the resolved final image output folder, or 0 if the folder does not exist.
     """
-    parent = resolve_expression("config.image_output.folders.parent", config)
-    renamed = resolve_expression("config.image_output.folders.renamed", config)
-
-    root = config.get("__project_root__")
-    if not root:
-        raise ValueError("Missing __project_root__ in config — cannot locate image folder.")
-
-    final_folder = Path(root) / parent / renamed
-
-    if not final_folder.exists():
-        log_message(f"⚠️ Final folder does not exist: {final_folder}", level="warning")
-        return 0
-
-    try:
-        image_files = [f for f in final_folder.rglob("*") if f.suffix.lower() in [".jpg", ".jpeg"]]
-        count = len(image_files)
-        log_message(f"Found {count} JPEG images in {final_folder}", level="info")
-        return count
-    except Exception as e:
-        log_message(f"Error counting images: {e}", level="warning")
-        return 0
+    logger = cfg.get_logger()
+    final_folder = cfg.paths.renamed
+    image_files = get_final_image_files(final_folder)
+    count = len(image_files)
+    if count == 0:
+        logger.warning(f"No JPEG images found in {final_folder}", indent=2)
+    else:
+        logger.custom(f"Found {count} JPEG images in {final_folder}", indent=2, emoji="📸")
+    return count
 
 
-def build_progress_json(config, expected_total):
+def build_progress_json(cfg: ConfigManager, expected_total, now=None):
     """
     Builds a JSON-compatible dictionary representing the initial upload progress status.
-    
-    Args:
-        config: Project configuration dictionary containing project, camera, and AWS details.
-        expected_total: The expected total number of images to be uploaded.
-    
-    Returns:
-        A dictionary with project, camera, and cloud metadata, timestamps, and initial progress metrics for upload
-        monitoring.
+    Optionally accepts a datetime for testability.
     """
-    now = datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
     project_info = {
-        "number": config["project"]["number"],
-        "slug": config["project"]["slug"],
-        "client": config["project"]["client"],
-        "railroad_name": config["project"]["rr_name"],
-        "railroad_code": config["project"]["rr_mark"],
-        "description": config["project"]["description"]
+        "number": cfg.get("project.number"),
+        "slug": cfg.get("project.slug"),
+        "client": cfg.get("project.client"),
+        "railroad_name": cfg.get("project.rr_name"),
+        "railroad_code": cfg.get("project.rr_mark"),
+        "description": cfg.get("project.description")
     }
 
     camera_info = {
-        "make": config["camera"]["make"],
-        "model": config["camera"]["model"],
-        "serial_number": config["camera"]["sn"],
-        "firmware": config["camera"]["firmware"],
-        "software": config["camera"]["software"]
+        "make": cfg.get("camera.make"),
+        "model": cfg.get("camera.model"),
+        "serial_number": cfg.get("camera.sn"),
+        "firmware": cfg.get("camera.firmware"),
+        "software": cfg.get("camera.software")
     }
 
     cloud_info = {
-        "bucket": config["aws"]["s3_bucket"],
-        "prefix": resolve_expression(config["aws"]["s3_bucket_folder"], config),
-        "region": config["aws"]["region"]
+        "bucket": cfg.get("aws.s3_bucket"),
+        "prefix": resolve_expression(cfg.get("aws.s3_bucket_folder"), cfg),
+        "region": cfg.get("aws.region")
     }
 
     return {
-        "project_slug": config["project"]["slug"],
+        "project_slug": cfg.get("project.slug"),
         "last_updated": now.isoformat(),
         "start_time": now.isoformat(),
         "end_time": None,
@@ -161,7 +143,7 @@ def build_progress_json(config, expected_total):
     }
 
 
-def upload_progress_json(s3_client, progress, bucket, slug, messages):
+def upload_progress_json(s3_client, progress, bucket, slug, logger):
     """
     Uploads the progress status JSON to an S3 bucket under the 'status/' prefix.
     
@@ -170,7 +152,7 @@ def upload_progress_json(s3_client, progress, bucket, slug, messages):
         progress: The progress status dictionary to upload.
         bucket: The name of the S3 bucket.
         slug: Project slug used to generate the filename.
-        messages: List to append log messages to.
+        logger:
     """
     filename = f"progress_{slug}.json"
     try:
@@ -180,12 +162,12 @@ def upload_progress_json(s3_client, progress, bucket, slug, messages):
             Body=json.dumps(progress, indent=2).encode("utf-8"),
             ContentType="application/json"
         )
-        log_message(f"✅ Uploaded {filename} to s3://{bucket}/status/", messages)
+        logger.success(f"Uploaded {filename} to s3://{bucket}/status/", indent=2)
     except Exception as e:
-        log_message(f"❌ Failed to upload progress JSON: {e}", messages, level="error")
+        logger.error(f"Failed to upload progress JSON: {e}", indent=2)
 
 
-def ensure_lambda_progress_monitor(lambda_client, role_arn, messages):
+def ensure_lambda_progress_monitor(cfg, lambda_client, role_arn):
     """
     Ensures the 'UploadProgressMonitor' Lambda function exists, deploying it if necessary.
     
@@ -193,21 +175,22 @@ def ensure_lambda_progress_monitor(lambda_client, role_arn, messages):
     source code and creates the Lambda function using the provided role ARN. Logs deployment status and raises a
     FileNotFoundError if the source file is missing.
     """
+    logger = cfg.get_logger()
+
     name = "UploadProgressMonitor"
     handler = "lambda_progress_monitor.lambda_handler"
 
     try:
         lambda_client.get_function(FunctionName=name)
-        log_message(f"✅ Lambda '{name}' already exists.", messages)
+        logger.info(f"Lambda '{name}' already exists.", indent=2)
         return
     except lambda_client.exceptions.ResourceNotFoundException:
-        log_message("🚀 Deploying UploadProgressMonitor Lambda...", messages)
+        logger.custom("Deploying UploadProgressMonitor Lambda...", indent=2, emoji="🚀")
 
-    progress_monitor_path = resolve_relative_to_pyt(PROGRESS_MONITOR_REL_PATH)
     try:
-        zipped = zip_lambda(progress_monitor_path, "lambda_progress_monitor.py")
+        zipped = zip_lambda(cfg.paths.lambda_pm_path, "lambda_progress_monitor.py")
     except FileNotFoundError as e:
-        log_message(f"❌ Lambda zip failed: {e}", messages, level="error")
+        logger.error(f"Lambda zip failed: {e}", indent=3)
         raise
     lambda_client.create_function(
         FunctionName=name,
@@ -219,32 +202,33 @@ def ensure_lambda_progress_monitor(lambda_client, role_arn, messages):
         MemorySize=256,
         Publish=True
     )
-    log_message(f"✅ Lambda '{name}' deployed.", messages)
+    logger.success(f"Lambda '{name}' deployed.", indent=2)
 
 
-def ensure_lambda_deactivator(lambda_client, role_arn, messages):
+def ensure_lambda_deactivator(cfg, lambda_client, role_arn):
     """
     Ensures the 'DisableUploadMonitorRule' Lambda function exists, deploying it if necessary.
     
     If the Lambda function does not exist, packages its source code and creates the function using the provided role
     ARN. Logs deployment status and raises FileNotFoundError if the source file is missing.
     """
+    logger = cfg.get_logger()
     name = "DisableUploadMonitorRule"
     handler = "disable_rule.lambda_handler"
 
     try:
         lambda_client.get_function(FunctionName=name)
-        log_message(f"✅ Lambda '{name}' already exists.", messages)
+        logger.info(f"Lambda '{name}' already exists.", indent=2)
         return
     except lambda_client.exceptions.ResourceNotFoundException:
-        log_message("🚀 Deploying DisableUploadMonitorRule Lambda...", messages)
+        logger.custom("Deploying DisableUploadMonitorRule Lambda...", indent=2, emoji="🚀")
 
     # 🔍 Resolve Lambda source files relative to config file
-    deactivator_path = resolve_relative_to_pyt(DEACTIVATOR_REL_PATH)
+    deactivator_path = cfg.paths.lambda_dr_path
     try:
         zipped = zip_lambda(deactivator_path, "disable_rule.py")
     except FileNotFoundError as e:
-        log_message(f"❌ Lambda zip failed: {e}", messages, level="error")
+        logger.error(f"Lambda zip failed: {e}", indent=3)
         raise
 
     lambda_client.create_function(
@@ -257,16 +241,18 @@ def ensure_lambda_deactivator(lambda_client, role_arn, messages):
         MemorySize=128,
         Publish=True
     )
-    log_message(f"✅ Lambda '{name}' deployed.", messages)
+    logger.success(f"Lambda '{name}' deployed.", indent=2)
 
 
-def setup_schedule_and_target(events_client, lambda_client, config, expected_total, messages):
+def setup_schedule_and_target(cfg, events_client, lambda_client, expected_total):
     """
     Creates or updates a CloudWatch Events rule to trigger the upload progress monitor Lambda.
     
     Configures a scheduled rule to invoke the "UploadProgressMonitor" Lambda function every 5 minutes, passing
     project-specific input parameters. Ensures the Lambda has the necessary permissions to be invoked by the event rule.
     """
+    logger = cfg.get_logger()
+
     rule_name = "UploadProgressScheduleRule"
     target_lambda = "UploadProgressMonitor"
 
@@ -279,9 +265,9 @@ def setup_schedule_and_target(events_client, lambda_client, config, expected_tot
     lambda_arn = lambda_client.get_function(FunctionName=target_lambda)["Configuration"]["FunctionArn"]
 
     project_config = {
-        "project_slug": config["project"]["slug"],
-        "bucket": config["aws"]["s3_bucket"],
-        "prefix": f"{config['project']['number']}/",
+        "project_slug": cfg.get("project.slug"),
+        "bucket": cfg.get("aws.s3_bucket"),
+        "prefix": f"{cfg.get('project.number')}/",
         "expected_total": expected_total
     }
 
@@ -303,11 +289,10 @@ def setup_schedule_and_target(events_client, lambda_client, config, expected_tot
             SourceArn=rule_arn
         )
 
-    log_message(f"✅ CloudWatch rule '{rule_name}' updated with target input.", messages, config=config)
+    logger.success(f"CloudWatch rule '{rule_name}' updated with target input.", indent=2)
 
 
-# 🎯 Main entrypoint
-def deploy_lambda_monitor(config: Optional[dict] = None, config_file: Optional[str] = None, messages: Optional[Any] = None):
+def deploy_lambda_monitor(cfg: ConfigManager):
     """
     Deploys and configures AWS Lambda functions and resources for monitoring image upload progress.
 
@@ -316,23 +301,20 @@ def deploy_lambda_monitor(config: Optional[dict] = None, config_file: Optional[s
     Logs key steps and warnings throughout the process.
 
     Args:
-        config: Optional configuration dictionary. If not provided, config_file is used.
-        config_file: Optional path to a configuration file. Used if config is not provided.
-        messages: Optional list to collect log messages.
+        cfg:
     """
-    if messages is None:
-        messages = []
+    logger = cfg.get_logger()
+    cfg.validate(tool="deploy_lambda_monitor")
 
-    config = resolve_config(config=config, config_file=config_file, tool_name="deploy_lambda_monitor")
-
-    region = config["aws"]["region"]
-    role_arn = config["aws"]["lambda_role_arn"]
-    slug = config["project"]["slug"]
-    bucket = config["aws"]["s3_bucket"]
+    region = cfg.get("aws.region")
+    role_arn = cfg.get("aws.lambda_role_arn")
+    slug = cfg.get("project.slug")
+    bucket = cfg.get("aws.s3_bucket")
 
     # Load credentials from keyring or config and verify AWS credentials
     try:
-        access_key, secret_key = get_aws_credentials(config)
+        logger.info("Verifying AWS credentials...", indent=1)
+        access_key, secret_key = get_aws_credentials(cfg)
         session = Session(
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
@@ -340,32 +322,26 @@ def deploy_lambda_monitor(config: Optional[dict] = None, config_file: Optional[s
         )
         sts = session.client("sts")
         sts.get_caller_identity()
-        log_message("✅ AWS credentials verified.", messages, config=config)
+        logger.custom("AWS credentials verified.", emoji="🔑", indent=2)
     except Exception as e:
-        log_message(f"❌ AWS credentials verification failed: {e}", messages, level="error", config=config)
+        logger.error(f"AWS credentials verification failed: {e}", indent=2)
         return
+    
+    logger.info("Preparing to deploy Lambda monitor...", indent=1)
 
-    expected_total = count_final_images(config)
-    log_message(f"📸 Found {expected_total} image(s) in final folder.", messages, config=config)
+    expected_total = count_final_images(cfg)
 
     if expected_total == 0:
-        log_message("⚠️ expected_total is 0 — progress tracking will show 0% until images appear.", messages,
-                    level="warning", config=config)
+        logger.warning("Expected_total is 0 — progress tracking will show 0% until images appear.", indent=2)
 
-    progress = build_progress_json(config, expected_total)
+    progress = build_progress_json(cfg, expected_total)
 
     s3 = session.client("s3")
     lambda_client = session.client("lambda")
     events_client = session.client("events")
 
-    upload_progress_json(s3, progress, bucket, slug, messages)
-    ensure_lambda_progress_monitor(lambda_client, role_arn, messages)
-    ensure_lambda_deactivator(lambda_client, role_arn, messages)
-    setup_schedule_and_target(events_client, lambda_client, config, expected_total, messages)
-
-
-# 🧪 CLI fallback
-if __name__ == "__main__":
-    from utils.config_loader import get_default_config_path
-    log_message("🧪 Running deploy_lambda_monitor standalone...", [])
-    deploy_lambda_monitor(config_file=get_default_config_path())
+    upload_progress_json(s3, progress, bucket, slug, logger)
+    ensure_lambda_progress_monitor(cfg, lambda_client, role_arn)
+    ensure_lambda_deactivator(cfg, lambda_client, role_arn)
+    setup_schedule_and_target(cfg, events_client, lambda_client, expected_total)
+    logger.success("Deployed AWS Lambda monitor.", indent=1)

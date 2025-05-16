@@ -1,23 +1,30 @@
 # =============================================================================
 # 📦 RMI 360 Imaging Workflow Toolbox (rmi_360_workflow.pyt)
 # -----------------------------------------------------------------------------
-# Toolbox Name:       RMI 360 Imaging Workflow Toolbox
-# Version:            1.0.0
-# Author:             RMI Valuation, LLC
-# Created:            2025-05-08
+# Purpose:             ArcGIS Python Toolbox entry point for the RMI 360 Imaging Workflow
+# Project:             RMI 360 Imaging Workflow Python Toolbox
+# Version:             1.0.0
+# Author:              RMI Valuation, LLC
+# Created:             2025-05-08
+# Last Updated:        2025-05-15
 #
 # Description:
-#   ArcGIS Python Toolbox wrapper that registers tools defined in /tools/*.py.
-#   This file defines the toolbox structure and provides entry points for each
-#   tool in the RMI 360 pipeline, but contains no processing logic itself.
+#   This file defines the ArcGIS Python Toolbox interface, registering all pipeline tools for the RMI 360 workflow.
+#   It acts as a wrapper and dispatcher, exposing tools for imagery processing, OID management, reporting, and AWS integration.
+#   No business logic is implemented here; all workflow logic resides in the /tools and /utils modules.
+#
+# File Location:        /rmi_360_workflow.pyt
+# Called By:            ArcGIS Pro (Toolbox registration), ArcGIS Python Toolbox Loader
 #
 # Directory Layout:
-#   tools/           → Tool classes (UI + execution)
-#   utils/           → Core logic modules
-#   utils/shared/    → Reusable stateless utilities
-#   docs/            → Markdown documentation
-#   configs/         → YAML templates and schema registry
-#   templates/       → HTML report and style templates
+#   tools/              → Tool classes (UI + execution)
+#   utils/              → Core processing and validation modules
+#   utils/manager/      → Configuration, Logging, Path and Progressor management modules
+#   utils/validators/   → Configuration and schema validation modules
+#   utils/shared/       → Reusable stateless utilities
+#   docs/               → Markdown documentation
+#   configs/            → YAML templates and schema registry
+#   templates/          → HTML report and style templates
 #
 # Registered Tools:
 #   - 🧰 Process360Workflow
@@ -41,6 +48,7 @@
 # Notes:
 #   - Supports background execution where applicable
 #   - Designed for ArcGIS Pro 3.4+ with Python 3.9+ environments
+#   - All tool logic is modularized for maintainability and extensibility
 # =============================================================================
 
 # Import tools to run individually

@@ -5,7 +5,7 @@
 #
 # schema_version (str): Defines which config format version this file conforms to.
 # Used for future validation and compatibility checks.
-schema_version: 1.0.0  # Pre-release schema version (non-enforced)
+schema_version: 1.1.0
 debug_messages: false
 
 # ------------------------------------------------------------------------------
@@ -43,6 +43,7 @@ debug_messages: false
 logs:
   path: "logs"
   report_path: "report"
+  logo_filename: "rmi_logo.png"  # Logo should be located in templates/assets
   prefix: "config.project.slug"
   mosaic_processor_log: "mosaic_processor_output.log"
   exiftool_logs: "exiftool_log.txt"
@@ -51,6 +52,7 @@ logs:
   geocode_args: "exiftool_geocode.args"
   gps_smooth_debug: "debuglog_outliers.csv"
   aws_upload_log: "aws_upload_log.csv"
+  aws_upload_summary: "aws_upload_summary.csv"
   enhance_log: "enhance_log.csv"
   rename_log: "rename_log.csv"
   process_log: "process_log.txt"
@@ -120,6 +122,10 @@ camera:
   sn: "<SERIAL_NUMBER>"                               # Serial number
   firmware: "2.2.0"                                   # Installed firmware version (adjust as needed)
   software: "Mosaic Processor 1.0.1/MistikaVR 10.14"  # Processing software version string (adjust as needed)
+  stitching_software: "MistikaVR"
+  image_width: 12288
+  image_height: 6144
+  source_photos: 6
 
 # --------------------------------------------------------------------
 # 📏 CAMERA OFFSET: GNSS to Camera Lens Center
@@ -305,7 +311,7 @@ oid_schema_template:
   template:
     auto_create_oid_template: true
     templates_dir: "templates"
-    gdb_path: "templates.gdb"
+    gdb_path: "templates.gdb"  # located in "templates_dir"
     template_name: "oid_schema_template"
   esri_default:
     field_registry: "configs/esri_oid_fields_registry.yaml"
@@ -443,6 +449,7 @@ image_output:
     renamed: "final"
   filename_settings:
     format: "{project_slug}_{rr}_{mp_pre}{mp_num}_{capture_datetime}_RL{reel}_FR{frame}.jpg"
+    format_no_lr: "{project_slug}_{rr}_{capture_datetime}_RL{reel}_FR{frame}.jpg"
     parts:
       project_slug: "config.project.slug"
       rr: "field.RR"
@@ -488,6 +495,29 @@ image_output:
       - "field.MP_Pre + '-' + field.MP_Num.float(3)"
       - "config.project.description"
       - "config.project.number"
+    GPano:
+      UsePanoramaViewer: "True"
+      CaptureSoftware: ""
+      StitchingSoftware: "config.camera.stitching_software"
+      ProjectionType: "equirectangular"
+      PoseHeadingDegrees: "field.CameraHeading"
+      PosePitchDegrees: "field.CameraPitch"
+      PoseRollDegrees: "field.CameraRoll"
+      InitialViewHeadingDegrees: "field.CameraHeading"
+      InitialViewPitchDegrees: "field.CameraPitch"
+      InitialViewRollDegrees: "field.CameraRoll"
+      InitialHorizontalFOVDegrees: 75.0
+      CroppedAreaLeftPixels: 0
+      CroppedAreaTopPixels: 0
+      CroppedAreaImageWidthPixels: "config.camera.image_width"
+      CroppedAreaImageHeightPixels: "config.camera.image_height"
+      FullPanoWidthPixels: "config.camera.image_width"
+      FullPanoHeightPixels: "config.camera.image_height"
+      FirstPhotoDate: "field.AcquisitionDate.date(%Y%m%dT%H%M%SZ)"
+      LastPhotoDate: "field.AcquisitionDate.date(%Y%m%dT%H%M%SZ)"
+      SourcePhotosCount: "config.camera.source_photos"
+      ExposureLockUsed: "True"
+      
 
 # ------------------------------------------------------------------------------
 # ☁️ AWS CLOUD EXPORT & HOSTING
@@ -681,9 +711,14 @@ geocoding:
 #    5. Brightness recovery (if enabled)
 # --------------------------------------------------------------------
 image_enhancement:
-  enabled: true               # Master switch for image enhancement
-  adaptive: true              # Enable adaptive tuning for CLAHE
-  max_workers: 16             # For high throughput without overloading
+  enabled: true                             # Master switch for image enhancement
+  dry_run: false                            # NOT IMPLEMENTED IN 1.1.0
+  adaptive: true                            # Enable adaptive tuning for CLAHE
+  max_workers: 16                           # For high throughput without overloading
+  auto_generate_profile: true               # NOT IMPLEMENTED IN 1.1.0
+  profile_json: "enhancement_profile.json"  # NOT IMPLEMENTED IN 1.1.0
+  ai_assist: true                           # NOT IMPLEMENTED IN 1.1.0
+  interval: 10                              # NOT IMPLEMENTED IN 1.1.0
 
   # ----------------------------------------------------------------
   # 🗂️ OUTPUT MODE
@@ -698,8 +733,9 @@ image_enhancement:
   # ----------------------------------------------------------------
   # ⚪ WHITE BALANCE SETTINGS
   # ----------------------------------------------------------------
-  apply_white_balance: true
+  apply_white_balance: true  # SUPERCEDED (BUT KEEP FOR NOW)
   white_balance:
+    enabled: true
     method: "gray_world"      # Options:
                               #   "gray_world" – Balance RGB to average intensity
                               #   "simple"     – OpenCV SimpleWB (more aggressive)
@@ -709,6 +745,7 @@ image_enhancement:
   # ----------------------------------------------------------------
   apply_contrast_enhancement: true
   clahe:
+    enabled: true
     tile_grid_size: [8, 8]           # Size of local regions for CLAHE
     contrast_thresholds: [60, 80]    # For adaptive clip limit
                                      # contrast < 60 → use clip_limit_high
@@ -722,6 +759,7 @@ image_enhancement:
   # ----------------------------------------------------------------
   apply_sharpening: true
   sharpen:
+    enabled: true
     # min_contrast_to_sharpen: 50    # (Optional) Only sharpen if contrast is high enough
     kernel:
       - [ 0, -0.3,  0 ]
@@ -733,6 +771,7 @@ image_enhancement:
   # ----------------------------------------------------------------
   brightness_recovery: true
   brightness:
+    enabled: true
     threshold: 110           # Only apply if brightness falls below this value
     factor: 1.1              # Multiplier to gently lift brightness (e.g., 1.1 = +10%)
 
@@ -741,6 +780,7 @@ image_enhancement:
   # ----------------------------------------------------------------
   apply_saturation_boost: true
   saturation_boost:
+    enabled: true
     factor: 1.1              # Multiply saturation (1.1 = +10%)
 
 # ----------------------------------------------------------------
@@ -780,4 +820,21 @@ orchestrator:
 
   # Location of the shared backup geodatabase where OID snapshots will be stored.
   # Backups are named like: OID_before_{step}_{timestamp}
-  oid_backup_fgdb: "backups/oid_snapshots.gdb"
+  backup_folder: "backups"
+  oid_backup_fgdb: "oid_snapshots.gdb"
+
+# ----------------------------------------------------------------
+# DISK SPACE CONFIG
+# ----------------------------------------------------------------
+disk_space:
+  check_enabled: True
+  min_buffer_ratio: 1.1
+
+# ----------------------------------------------------------------
+# OPENAI CONFIG
+# ----------------------------------------------------------------
+openai:
+  keyring_openai: false             # NOT IMPLEMENTED IN 1.1.0
+  keyring_service_name: openai_kr   # NOT IMPLEMENTED IN 1.1.0
+  api_key: <YOUR OPENAI API KEY>    # NOT IMPLEMENTED IN 1.1.0
+  model: "gpt-4o"                   # NOT IMPLEMENTED IN 1.1.0

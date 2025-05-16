@@ -3,29 +3,32 @@
 # -----------------------------------------------------------------------------
 # Tool Name:          Process360Workflow
 # Toolbox Context:    rmi_360_workflow.pyt
-# Version:            1.0.0
+# Version:            1.1.0
 # Author:             RMI Valuation, LLC
 # Created:            2025-05-08
+# Last Updated:       2025-05-15
 #
 # Description:
 #   Orchestrates the full end-to-end Mosaic 360 image processing pipeline within ArcGIS Pro.
 #   Executes a configurable series of steps, including image rendering, OID creation, image
 #   enrichment, geolocation, cloud upload, and service publishing. Tracks progress and logs
-#   results to a persistent report JSON for dashboard and reporting use.
+#   results to a persistent report JSON for dashboard and reporting use. Integrates with Core Utils
+#   for all workflow, configuration, and reporting steps.
 #
 # File Location:      /tools/process_360_orchestrator.py
-# Uses:
+# Core Utils:
 #   - utils/build_step_funcs.py
 #   - utils/step_runner.py
-#   - utils/config_loader.py
-#   - utils/report_data_builder.py
-#   - utils/folder_utils.py
-#   - utils/gather_metrics.py
-#   - utils/arcpy_utils.py
 #   - utils/generate_report.py
+#   - utils/manager/config_manager.py
+#   - utils/shared/report_data_builder.py
+#   - utils/shared/folder_stats.py
+#   - utils/shared/gather_metrics.py
+#   - utils/shared/arcpy_utils.py
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/process_360_orchestrator.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/process_360_orchestrator.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Parameters:
 #   - Start From Step (Optional) {start_step} (String): Step label to start from. Skips earlier steps if selected.
@@ -42,41 +45,113 @@
 #   - Generate HTML Summary Report? {generate_report} (Boolean): Whether to generate a visual summary at the end.
 #
 # Notes:
-#   - Uses a step dispatcher to execute ordered functions defined in build_step_funcs
-#   - Skipped steps are safely logged and retained in the report JSON
-#   - Can resume from an existing report if rerun on the same project
+#   - Uses a step dispatcher to execute ordered functions defined in build_step_funcs.
+#   - Skipped steps are safely logged and retained in the report JSON.
+#   - Can resume from an existing report if rerun on the same project.
+#   - Ensure all Core Utils and config files are up-to-date for workflow success.
 # =============================================================================
 
 import arcpy
 import time
 import os
+from typing import Optional, Any, Callable, Dict, List
 
-from utils.config_loader import get_default_config_path, resolve_config
-from utils.arcpy_utils import log_message, str_to_bool
+from utils.manager.config_manager import ConfigManager
+from utils.shared.arcpy_utils import str_to_bool
 from utils.generate_report import generate_report_from_json
-
-# Import report generation functions
 from utils.step_runner import run_steps
 from utils.build_step_funcs import build_step_funcs, get_step_order
-from utils.gather_metrics import collect_oid_metrics, summarize_oid_metrics
-from utils.folder_utils import folder_stats
-from utils.report_data_builder import initialize_report_data, save_report_json, load_report_json_if_exists
+from utils.shared.gather_metrics import collect_oid_metrics, summarize_oid_metrics
+from utils.shared.folder_stats import folder_stats
+from utils.shared.report_data_builder import initialize_report_data, save_report_json, load_report_json_if_exists
 
 
 class Process360Workflow(object):
+    def __init__(
+        self,
+        arcpy_mod: Any = None,
+        os_mod: Any = None,
+        time_mod: Any = None,
+        collect_oid_metrics_fn: Optional[Callable] = None,
+        summarize_oid_metrics_fn: Optional[Callable] = None,
+        folder_stats_fn: Optional[Callable] = None,
+        build_step_funcs_fn: Optional[Callable] = None,
+        get_step_order_fn: Optional[Callable] = None,
+        run_steps_fn: Optional[Callable] = None,
+        initialize_report_data_fn: Optional[Callable] = None,
+        save_report_json_fn: Optional[Callable] = None,
+        load_report_json_if_exists_fn: Optional[Callable] = None,
+        generate_report_from_json_fn: Optional[Callable] = None
+    ):
+        """
+        Allows injection of dependencies for testability.
+        Defaults to real modules/functions if not provided.
+        """
+        self.arcpy_mod = arcpy_mod or arcpy
+        self.os_mod = os_mod or os
+        self.time_mod = time_mod or time
+        self.collect_oid_metrics_fn = collect_oid_metrics_fn or collect_oid_metrics
+        self.summarize_oid_metrics_fn = summarize_oid_metrics_fn or summarize_oid_metrics
+        self.folder_stats_fn = folder_stats_fn or folder_stats
+        self.build_step_funcs_fn = build_step_funcs_fn or build_step_funcs
+        self.get_step_order_fn = get_step_order_fn or get_step_order
+        self.run_steps_fn = run_steps_fn or run_steps
+        self.initialize_report_data_fn = initialize_report_data_fn or initialize_report_data
+        self.save_report_json_fn = save_report_json_fn or save_report_json
+        self.load_report_json_if_exists_fn = load_report_json_if_exists_fn or load_report_json_if_exists
+        self.generate_report_from_json_fn = generate_report_from_json_fn or generate_report_from_json
+
+    @staticmethod
+    def parameters_to_dict(parameters: List[Any]) -> Dict[str, Any]:
+        """
+        Converts ArcPy tool parameters to a dictionary keyed by parameter name.
+        Ensures all GPBoolean and 'enable_*' parameters are Python bools for skip logic.
+        """
+        from utils.shared.arcpy_utils import str_to_bool
+        result = {}
+        for param in parameters:
+            # Convert GPBoolean and all 'enable_*' params to bool
+            if getattr(param, 'datatype', None) == 'GPBoolean' or param.name.startswith('enable_'):
+                result[param.name] = str_to_bool(param.value)
+            else:
+                result[param.name] = param.valueAsText
+        return result
+
+    def _compute_and_store_folder_stats(self, labels: List[str], paths: Any, report_data: dict, logger: Any):
+        """
+        Helper to compute and store folder stats for the given labels.
+        """
+        for label in labels:
+            try:
+                folder_path = getattr(paths, label)
+                count, size = self.folder_stats_fn(folder_path)
+                report_data.setdefault("paths", {})[f"{label}_images"] = str(folder_path)
+                report_data.setdefault("metrics", {})[f"{label}_count"] = count
+                report_data.setdefault("metrics", {})[f"{label}_size"] = size
+            except Exception as e:
+                report_data.setdefault("metrics", {})[f"{label}_count"] = 0
+                report_data.setdefault("metrics", {})[f"{label}_size"] = "0 B"
+                logger.warning(f"Failed to compute folder stats for {label}: {e}")
+
     label = "Process Full Mosaic 360 Workflow"
     description = (
         "Runs the full Mosaic 360 image processing pipeline including:\n"
         "1) Run Mosaic Processor\n"
         "2) Create Oriented Imagery Dataset\n"
         "3) Add Images to OID\n"
-        "4) Smooth GPS Noise\n"
-        "5) Update Linear and Custom Attributes\n"
-        "6) Rename and Tag\n"
-        "7) Geocode Images (optional)\n"
-        "8) Create OID Footprints\n"
-        "9) Copy to AWS (optional)\n"
-        "10) Generate OID Service (optional)"
+        "4) Assign Group Index\n"
+        "5) Calculate OID Attributes\n"
+        "6) Smooth GPS Noise (optional)\n"
+        "7) Correct Flagged GPS Points (optional)\n"
+        "8) Update Linear and Custom Attributes (linear referencing optional)\n"
+        "9) Enhance Images [EXPERIMENTAL] (optional)\n"
+        "10) Rename Images\n"
+        "11) Update EXIF Metadata\n"
+        "12) Geocode Images (optional)\n"
+        "13) Create OID Footprints\n"
+        "14) Deploy Lambda Monitor (optional)\n"
+        "15) Copy to AWS (optional)\n"
+        "16) Generate OID Service (optional)"
     )
     canRunInBackground = False
 
@@ -90,7 +165,7 @@ class Process360Workflow(object):
         (6, "smooth_gps", "Smooth GPS Noise"),
         (7, "correct_gps", "Correct Flagged GPS Points"),
         (8, "update_linear_custom", "Update Linear and Custom Attributes"),
-        (9, "enhance_images", "Enhance Images"),
+        (9, "enhance_images", "Enhance Images [EXPERIMENTAL]"),
         (10, "rename_images", "Rename Images"),
         (11, "update_metadata", "Update EXIF Metadata"),
         (12, "geocode", "Geocode Images"),
@@ -114,6 +189,43 @@ class Process360Workflow(object):
         """
         params = []
 
+        # 1. Project Folder [0]
+        project_folder_param = arcpy.Parameter(
+            displayName="Project Folder",
+            name="project_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input"
+        )
+        params.append(project_folder_param)
+
+        # 2. Input Reels Folder [1]
+        input_reels_folder_param = arcpy.Parameter(
+            displayName="Input Reels Folder",
+            name="input_reels_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input"
+        )
+        params.append(input_reels_folder_param)
+
+        # 3. Custom Config File [2]
+        config_file_param = arcpy.Parameter(
+            displayName="Custom Config File",
+            name="config_file",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input"
+        )
+        config_file_param.filter.list = ["yaml", "yml"]
+        params.append(config_file_param)
+
+        # 4. Start From Step [3]
+        step_label_map = {label: name for _, name, label in self.STEP_FUNCTIONS}
+        label_to_name = {label: name for _, name, label in self.STEP_FUNCTIONS}
+        name_to_label = {name: label for _, name, label in self.STEP_FUNCTIONS}
+        step_labels = [label for _, _, label in self.STEP_FUNCTIONS]
+
         start_step_param = arcpy.Parameter(
             displayName="Start From Step (Optional)",
             name="start_step",
@@ -121,106 +233,139 @@ class Process360Workflow(object):
             parameterType="Optional",
             direction="Input"
         )
-        start_step_param.filter.list = ["--SELECT STEP--"] + self.STEP_ORDER
+        start_step_param.filter.list = ["--SELECT STEP--"] + step_labels
         start_step_param.value = "--SELECT STEP--"
         params.append(start_step_param)
 
-        params.append(arcpy.Parameter(
-            displayName="Project Folder",
-            name="project_folder",
-            datatype="DEFolder",
-            parameterType="Required",
-            direction="Input"
-        ))
+        # Save for use in updateParameters/updateMessages/execute
+        self._step_label_to_name = label_to_name
+        self._step_name_to_label = name_to_label
 
-        params.append(arcpy.Parameter(
-            displayName="Input Reels Folder",
-            name="input_reels_folder",
-            datatype="DEFolder",
-            parameterType="Required",
-            direction="Input"
-        ))
-
-        params.append(arcpy.Parameter(
+        # 5. OID Input [4]
+        oid_fc_input_param = arcpy.Parameter(
             displayName="OID Dataset - Input (used in most steps)",
             name="oid_fc_input",
             datatype="DEFeatureClass",
             parameterType="Optional",
-            direction="Input",
-            enabled=False
-        ))
+            direction="Input"
+        )
+        oid_fc_input_param.enabled = False
+        params.append(oid_fc_input_param)
 
-        params.append(arcpy.Parameter(
-            displayName="OID Dataset - Output (used only for 'Run Mosaic Processor' or 'Create OID')",
+        # 6. OID Output [5]
+        oid_fc_output_param = arcpy.Parameter(
+            displayName="OID Dataset - Output (used only when creating a new OID)",
             name="oid_fc_output",
             datatype="DEFeatureClass",
             parameterType="Optional",
-            direction="Output",
-            enabled=False
-        ))
+            direction="Output"
+        )
+        oid_fc_output_param.enabled = False
+        params.append(oid_fc_output_param)
 
-        centerline_param = arcpy.Parameter(
-            displayName="Centerline (M-enabled, used for GPS smoothing and linear referencing)",
-            name="centerline_fc",
-            datatype="DEFeatureClass",
-            parameterType="Required",
+        # 7. Enable Smooth GPS (and Correct GPS) [6]
+        enable_smooth_gps_param = arcpy.Parameter(
+            displayName="Enable Smooth GPS (and Correct GPS)",
+            name="enable_smooth_gps",
+            datatype="GPBoolean",
+            parameterType="Optional",
             direction="Input"
         )
-        centerline_param.filter.list = ["Polyline"]
-        params.append(centerline_param)
+        enable_smooth_gps_param.value = True
+        params.append(enable_smooth_gps_param)
 
-        route_id_param = arcpy.Parameter(
-            displayName="Route ID Field",
-            name="route_id_field",
-            datatype="Field",
-            parameterType="Required",
-            direction="Input"
-        )
-        route_id_param.parameterDependencies = [centerline_param.name]
-        route_id_param.filter.list = ["Short", "Long", "Text"]
-        params.append(route_id_param)
-
-        enable_lr_param = arcpy.Parameter(
+        # 8. Enable Linear Referencing [7]
+        enable_linear_ref_param = arcpy.Parameter(
             displayName="Enable Linear Referencing",
             name="enable_linear_ref",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input"
         )
-        enable_lr_param.value = True
-        params.append(enable_lr_param)
+        enable_linear_ref_param.value = True
+        params.append(enable_linear_ref_param)
 
-        skip_enhance_param = arcpy.Parameter(
-            displayName="Skip Enhance Images?",
-            name="skip_enhance_images",
+        # 9. Enable Enhance Images [8]
+        enable_enhance_images_param = arcpy.Parameter(
+            displayName="Enable Enhance Images [EXPERIMENTAL]",
+            name="enable_enhance_images",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input"
         )
-        skip_enhance_param.value = False
-        params.append(skip_enhance_param)
+        enable_enhance_images_param.value = False
+        params.append(enable_enhance_images_param)
 
-        copy_to_aws_param = arcpy.Parameter(
-            displayName="Copy Processed Images to AWS S3?",
-            name="copy_to_aws",
+        # 10. Enable Geocode Images [9]
+        enable_geocode_param = arcpy.Parameter(
+            displayName="Enable Geocode Images",
+            name="enable_geocode",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input"
         )
-        copy_to_aws_param.value = True
-        params.append(copy_to_aws_param)
+        enable_geocode_param.value = True
+        params.append(enable_geocode_param)
 
-        config_param = arcpy.Parameter(
-            displayName="Custom Config File (Leave blank to use default config.yaml)",
-            name="config_file",
-            datatype="DEFile",
+        # 11. Enable Copy to AWS [10]
+        enable_copy_to_aws_param = arcpy.Parameter(
+            displayName="Enable Copy to AWS",
+            name="enable_copy_to_aws",
+            datatype="GPBoolean",
             parameterType="Optional",
             direction="Input"
         )
-        params.append(config_param)
+        enable_copy_to_aws_param.value = True
+        params.append(enable_copy_to_aws_param)
 
+        # 12. Enable Deploy Lambda Monitor [11]
+        enable_deploy_lambda_monitor_param = arcpy.Parameter(
+            displayName="Enable Deploy Lambda Monitor",
+            name="enable_deploy_lambda_monitor",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        enable_deploy_lambda_monitor_param.value = True
+        params.append(enable_deploy_lambda_monitor_param)
+
+        # 13. Enable Generate OID Service [12]
+        enable_generate_service_param = arcpy.Parameter(
+            displayName="Enable Generate OID Service",
+            name="enable_generate_service",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        enable_generate_service_param.value = True
+        params.append(enable_generate_service_param)
+
+        # 14. Centerline [13] (dynamic logic in updateParameters)
+        centerline_param = arcpy.Parameter(
+            displayName="Centerline (M-enabled, used for GPS smoothing and linear referencing)",
+            name="centerline_fc",
+            datatype="DEFeatureClass",
+            parameterType="Optional",
+            direction="Input"
+        )
+        centerline_param.filter.list = ["Polyline"]
+        params.append(centerline_param)
+
+        # 15. Route ID Field [14]
+        route_id_param = arcpy.Parameter(
+            displayName="Route ID Field",
+            name="route_id_field",
+            datatype="Field",
+            parameterType="Optional",
+            direction="Input"
+        )
+        route_id_param.parameterDependencies = [centerline_param.name]
+        route_id_param.filter.list = ["Short", "Long", "Text"]
+        params.append(route_id_param)
+
+        # 16. Generate HTML Summary Report [15]
         generate_report_param = arcpy.Parameter(
-            displayName="Generate HTML Summary Report?",
+            displayName="Generate HTML Summary Report",
             name="generate_report",
             datatype="GPBoolean",
             parameterType="Optional",
@@ -233,23 +378,24 @@ class Process360Workflow(object):
 
     def updateParameters(self, parameters):
         """
-        Dynamically enables or disables OID input and output parameters based on the selected start step.
-        
-        If the start step is "run_mosaic_processor" or "create_oid", enables the output OID parameter and disables the
-        input OID parameter; otherwise, enables the input OID parameter and disables the output OID parameter. Clears
-        the value of any parameter that is disabled.
+        Dynamically enables or disables OID input/output and Centerline/Route ID parameters based on selected step and toggles.
         """
-        start_step_param = parameters[0]  # Start step param
-        oid_in = parameters[3]  # oid_fc_input
-        oid_out = parameters[4]  # oid_fc_output
+        start_step_param = parameters[3]  # Start step param
+        oid_in = parameters[4]  # oid_fc_input
+        oid_out = parameters[5]  # oid_fc_output
+        enable_smooth_gps = parameters[6]  # enable_smooth_gps
+        enable_linear_ref = parameters[7]  # enable_linear_ref
+        centerline_param = parameters[13]  # centerline_fc
+        route_id_param = parameters[14]  # route_id_field
 
+        # Defensive: ensure label-to-name mapping exists even if getParameterInfo not called
+        if not hasattr(self, '_step_label_to_name') or not hasattr(self, '_step_name_to_label'):
+            self._step_label_to_name = {label: name for _, name, label in self.STEP_FUNCTIONS}
+            self._step_name_to_label = {name: label for _, name, label in self.STEP_FUNCTIONS}
+        # OID enable/disable logic
         if start_step_param.altered:
-            step = start_step_param.valueAsText
-
-            # Treat placeholder as "no selection"
-            if step == "--SELECT STEP--":
-                step = ""
-
+            step_label = start_step_param.valueAsText
+            step = self._step_label_to_name.get(step_label, "") if step_label and step_label != "--SELECT STEP--" else ""
             if step in ("run_mosaic_processor", "create_oid"):
                 oid_in.enabled = False
                 oid_out.enabled = True
@@ -259,157 +405,217 @@ class Process360Workflow(object):
             else:
                 oid_in.enabled = False
                 oid_out.enabled = False
-
             oid_in.value = None if not oid_in.enabled else oid_in.value
             oid_out.value = None if not oid_out.enabled else oid_out.value
+
+        # Centerline and Route ID dynamic logic
+        linear_ref_enabled = bool(enable_linear_ref.value)
+        smooth_gps_enabled = bool(enable_smooth_gps.value)
+
+        if linear_ref_enabled:
+            centerline_param.enabled = True
+            centerline_param.parameterType = "Required"
+            route_id_param.enabled = True
+            route_id_param.parameterType = "Required"
+        elif smooth_gps_enabled:
+            centerline_param.enabled = True
+            centerline_param.parameterType = "Optional"
+            route_id_param.enabled = False
+            route_id_param.parameterType = "Optional"
+            route_id_param.value = None
+        else:
+            centerline_param.enabled = False
+            centerline_param.parameterType = "Optional"
+            centerline_param.value = None
+            route_id_param.enabled = False
+            route_id_param.parameterType = "Optional"
+            route_id_param.value = None
+
+        # Copy to AWS logic: disable downstream toggles if not enabled
+        enable_copy_to_aws = parameters[10]  # index for Enable Copy to AWS
+        enable_deploy_lambda_monitor = parameters[11]
+        enable_generate_service = parameters[12]
+        if not bool(enable_copy_to_aws.value):
+            enable_deploy_lambda_monitor.enabled = False
+            enable_deploy_lambda_monitor.value = False
+            enable_generate_service.enabled = False
+            enable_generate_service.value = False
+        else:
+            enable_deploy_lambda_monitor.enabled = True
+            enable_generate_service.enabled = True
 
     def updateMessages(self, parameters):
         """
         Validates workflow parameters and sets error or warning messages for user guidance.
-        
-        Checks the selected start step and OID dataset parameters, displaying appropriate
-        messages if required values are missing or if existing data may be overwritten or reused.
+        Updates messages for Centerline and Route ID based on enabled toggles and requirements.
         """
-        start_step_param = parameters[0]
-        oid_in = parameters[3]
-        oid_out = parameters[4]
+        start_step_param = parameters[3]
+        oid_in = parameters[4]
+        oid_out = parameters[5]
+        enable_smooth_gps = parameters[6]
+        enable_linear_ref = parameters[7]
+        centerline_param = parameters[13]
+        route_id_param = parameters[14]
 
-        start_step = start_step_param.valueAsText
+        # Defensive: ensure label-to-name mapping exists even if getParameterInfo not called
+        if not hasattr(self, '_step_label_to_name') or not hasattr(self, '_step_name_to_label'):
+            self._step_label_to_name = {label: name for _, name, label in self.STEP_FUNCTIONS}
+            self._step_name_to_label = {name: label for _, name, label in self.STEP_FUNCTIONS}
+        step_label = start_step_param.valueAsText
+        step = self._step_label_to_name.get(step_label, "") if step_label and step_label != "--SELECT STEP--" else ""
+        linear_ref_enabled = bool(enable_linear_ref.value)
+        smooth_gps_enabled = bool(enable_smooth_gps.value)
 
-        if start_step == "--SELECT STEP--":
+        # Start step and OID messages
+        if step_label == "--SELECT STEP--":
             start_step_param.setErrorMessage("⚠️ Please select a valid Start Step before running.")
-        elif start_step in ("run_mosaic_processor", "create_oid"):
+        elif step in ("run_mosaic_processor", "create_oid"):
             oid_out.setWarningMessage("⚠️ Existing OID will be overwritten if it exists.")
         else:
             oid_in.setWarningMessage("ℹ️ Existing OID will be used and preserved.")
-
         if oid_in.enabled and not oid_in.valueAsText:
             oid_in.setErrorMessage("⚠️ Please specify the existing OID dataset.")
         elif oid_out.enabled and not oid_out.valueAsText:
             oid_out.setErrorMessage("⚠️ Please specify the output path for the new OID dataset.")
 
-    def execute(self, parameters, messages):
+        # Centerline and Route ID messages
+        if linear_ref_enabled:
+            if not centerline_param.valueAsText:
+                centerline_param.setErrorMessage("⚠️ Centerline is required when Linear Referencing is enabled.")
+            if not route_id_param.valueAsText:
+                route_id_param.setErrorMessage("⚠️ Route ID is required when Linear Referencing is enabled.")
+        elif smooth_gps_enabled:
+            centerline_param.clearMessage()
+            route_id_param.clearMessage()
+        else:
+            centerline_param.clearMessage()
+            route_id_param.clearMessage()
+
+    def execute(self, parameters: list, messages: Any) -> None:
         """
         Executes the full Mosaic 360 image processing workflow and generates reports.
-        
-        Runs the configured pipeline steps from the selected start point, manages parameter resolution, collects
-        metrics, and saves progress and results to a report JSON. Optionally generates an HTML summary report upon
-        completion. Handles error conditions gracefully, logging warnings for recoverable issues and continuing
-        execution where possible.
+        Allows dependency injection for testability. Compatible with ArcGIS Pro GUI.
         """
-        p = {param.name: param.valueAsText for param in parameters}
+        # Map parameters to dict
+        p = self.parameters_to_dict(parameters)
         # Determine which OID param was enabled and populate p["oid_fc"]
-        if parameters[4].enabled:
-            p["oid_fc"] = parameters[4].valueAsText  # oid_fc_output
+        if parameters[5].enabled:
+            p["oid_fc"] = parameters[5].valueAsText  # oid_fc_output
         else:
-            p["oid_fc"] = parameters[3].valueAsText  # oid_fc_input
+            p["oid_fc"] = parameters[4].valueAsText  # oid_fc_input
 
         generate_report_flag = str_to_bool(p.get("generate_report", "true"))
 
-        config = resolve_config(
-            config_file=p.get("config_file") or get_default_config_path(),
-            project_folder=p["project_folder"],
-            messages=messages
+        cfg = ConfigManager.from_file(
+            path=p.get("config_file"),
+            project_base=p["project_folder"],
+            messages=messages,
         )
+        logger = cfg.get_logger(messages)
+        paths = cfg.paths
 
-        log_message("--- Starting Mosaic 360 Workflow ---", messages, config=config)
-        log_message(f"[DEBUG] Using config: {config.get('__source__')}", messages, level="debug", config=config)
-        log_message(f"[DEBUG] Project root: {config.get('__project_root__')}", messages, level="debug", config=config)
+        logger.custom("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", indent=0, emoji="🚀")
+        logger.custom("| --- Starting Mosaic 360 Workflow --- |", indent=0, emoji="🚀")
+        logger.custom("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", indent=0, emoji="🚀")
+        logger.info(f"Using config: {cfg.source_path}", indent=1)
+        logger.info(f"Project root: {cfg.get('__project_root__')}", indent=1)
+
+        if cfg.get("debug_messages", False):
+            logger.custom("Debug mode enabled from config", indent=1, emoji="🔍")
+       
+        cfg.validate()
 
         # Build steps + order
-        step_funcs = build_step_funcs(p, config, messages)
-        step_order = get_step_order(step_funcs)
+        step_funcs = self.build_step_funcs_fn(p, cfg)
+        step_order = self.get_step_order_fn(step_funcs)
 
         # Initialize report data
-        report_data = load_report_json_if_exists(p["project_folder"], config, messages)
+        report_data = self.load_report_json_if_exists_fn(cfg)
         if report_data is None:
-            report_data = initialize_report_data(p, config)
-            save_report_json(report_data, p["project_folder"], config, messages)
+            report_data = self.initialize_report_data_fn(p, cfg)
+            self.save_report_json_fn(report_data, cfg)
         else:
-            log_message("🔁 Loaded existing report JSON — appending new steps", messages, config=config)
+            logger.custom("Loaded existing report JSON — appending new steps", indent=1, emoji="🔄")
 
         # Execute steps and capture results
-        t_start = time.time()
-        start_step = p.get("start_step") or step_order[0]
+        t_start = self.time_mod.time()
+
+        # Defensive: ensure label-to-name mapping exists even if getParameterInfo not called
+        if not hasattr(self, '_step_label_to_name') or not hasattr(self, '_step_name_to_label'):
+            self._step_label_to_name = {label: name for _, name, label in self.STEP_FUNCTIONS}
+            self._step_name_to_label = {name: label for _, name, label in self.STEP_FUNCTIONS}
+        
+        # Map label to step name for execution
+        step_label = p.get("start_step")
+        start_step = self._step_label_to_name.get(step_label, step_order[0]) if step_label and step_label != "--SELECT STEP--" else step_order[0]
         if start_step not in step_order:
-            log_message(f"Invalid start_step '{start_step}' provided. Falling back to default '{step_order[0]}'.",
-                        messages, level="warning", config=config)
+            logger.warning(f"Invalid start_step '{start_step}' provided. Falling back to default '{step_order[0]}'.", indent=1)
             start_step = step_order[0]
         start_index = step_order.index(start_step)
 
-        wait_config = config.get("orchestrator", {})
-        run_steps(step_funcs, step_order, start_index, p, report_data, p["project_folder"], config, messages,
-                  wait_config=wait_config)
+        wait_config = cfg.get("orchestrator", {})
+        self.run_steps_fn(step_funcs, step_order, start_index, p, report_data, cfg, wait_config=wait_config)
 
         # After the OID has been created (via run_steps), describe its GDB path
         try:
-            report_data.setdefault("paths", {})["oid_gdb"] = arcpy.Describe(p["oid_fc"]).path
+            report_data.setdefault("paths", {})["oid_gdb"] = self.arcpy_mod.Describe(p["oid_fc"]).path
         except Exception as e:
-            log_message(f"[WARNING] Could not describe OID FC yet: {e}", messages, level="warning", config=config)
+            logger.warning(f"Could not describe OID FC yet: {e}", indent=1)
             report_data.setdefault("paths", {})["oid_gdb"] = "Unavailable"
 
         # OID-based metrics
         try:
-            raw_metrics = collect_oid_metrics(p["oid_fc"])
-            summary, reels = summarize_oid_metrics(raw_metrics)
+            raw_metrics = self.collect_oid_metrics_fn(p["oid_fc"])
+            summary, reels = self.summarize_oid_metrics_fn(raw_metrics)
             report_data["metrics"].update(summary)
             report_data["reels"] = reels
         except Exception as e:
-            log_message(f"[WARNING] Could not gather OID stats: {e}", messages, level="warning", config=config)
+            logger.warning(f"Could not gather OID stats: {e}", indent=1)
 
         # Reel folder count
         try:
-            reel_folders = [f for f in os.listdir(p["input_reels_folder"]) if
-                            os.path.isdir(os.path.join(p["input_reels_folder"], f))]
+            reel_folders = [f for f in self.os_mod.listdir(p["input_reels_folder"]) if
+                            self.os_mod.path.isdir(self.os_mod.path.join(p["input_reels_folder"], f))]
             report_data["metrics"]["reel_count"] = len(reel_folders)
         except Exception as e:
             report_data["metrics"]["reel_count"] = "—"
-            log_message(f"[WARNING] Failed to count reel folders: {e}", messages, level="warning", config=config)
+            logger.warning(f"Failed to count reel folders: {e}", indent=1)
 
         # Folder stats for original/enhanced/renamed
-        for label in ["original", "enhanced", "renamed"]:
-            path = report_data.setdefault("paths", {}).get(f"{label}_images")
-            try:
-                count, size = folder_stats(path)
-                report_data.setdefault("metrics", {})[f"{label}_count"] = count
-                report_data.setdefault("metrics", {})[f"{label}_size"] = size
-            except Exception as e:
-                report_data.setdefault("metrics", {})[f"{label}_count"] = 0
-                report_data.setdefault("metrics", {})[f"{label}_size"] = "0 B"
-                log_message(f"[WARNING] Failed to compute folder stats for {label}: {e}", messages, level="warning",
-                            config=config)
+        self._compute_and_store_folder_stats(["original", "enhanced", "renamed"], paths, report_data, logger)
 
         # Elapsed time
-        elapsed_total = time.time() - t_start
+        elapsed_total = self.time_mod.time() - t_start
         report_data["metrics"]["elapsed"] = f"{elapsed_total:.1f} sec"
         total_images = report_data["metrics"].get("total_images", 0)
         if total_images:
             report_data["metrics"]["time_per_image"] = f"{elapsed_total / total_images:.2f} sec/image"
 
         # Determine report output folder
-        report_dir = os.path.join(p["project_folder"], config.get("logs", {}).get("report_path", "report"))
-        report_data["paths"]["report_dir"] = report_dir
+        report_dir = paths.report
+        report_data["paths"]["report_dir"] = str(report_dir)
 
         # Save report data to JSON for future recovery/report generation
-        save_report_json(report_data, p["project_folder"], config, messages)
+        self.save_report_json_fn(report_data, cfg)
 
         if generate_report_flag:
             try:
-                report_data["config"] = config  # REQUIRED for path resolver
-                slug = config.get("project", {}).get("slug", "unknown")
-                json_path = os.path.join(p["project_folder"], config.get("logs", {}).get("report_path", "report"),
-                                         f"report_data_{slug}.json")
+                report_data["config"] = cfg
+                slug = cfg.get("project.slug", "unknown")
+                json_path = self.os_mod.path.join(paths.report, f"report_data_{slug}.json")
 
-                generate_report_from_json(
+                self.generate_report_from_json_fn(
                     json_path=json_path,
-                    output_dir=report_dir,
-                    messages=messages,
-                    config=config
+                    cfg=cfg
                 )
-                log_message(f"📄 Final report and JSON saved to: {report_dir}", messages, config=config)
+                logger.custom(f"Final report and JSON saved to: {report_dir}", indent=1, emoji="📄")
+                # Export log to HTML
+                logger.export_html()
             except Exception as e:
-                log_message(f"[WARNING] Report generation failed: {e}", messages, level="warning", config=config)
+                logger.warning(f"Report generation failed: {e}", indent=1)
         else:
-            log_message("⏭️ Skipping report generation (disabled by user)", messages, config=config)
-
-        log_message("--- Mosaic 360 Workflow Complete ---", messages, config=config)
+            logger.custom("Skipping report generation (disabled by user)", indent=1, emoji="⏭️")
+        
+        logger.custom("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", indent=0, emoji="🎉")
+        logger.custom("| --- Mosaic 360 Workflow Complete --- |", indent=0, emoji="🎉")
+        logger.custom("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", indent=0, emoji="🎉")

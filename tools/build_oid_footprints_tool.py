@@ -3,34 +3,42 @@
 # -----------------------------------------------------------------------------
 # Tool Name:          BuildOIDFootprints
 # Toolbox Context:    rmi_360_workflow.pyt
-# Version:            1.0.0
+# Version:            1.1.0
 # Author:             RMI Valuation, LLC
 # Created:            2025-05-08
+# Last Updated:       2025-05-15
 #
 # Description:
-#   Implements ArcPy Tool class for generating a BUFFER-style footprint feature class from
-#   an Oriented Imagery Dataset (OID). Uses ArcGIS’s BuildOrientedImageryFootprint and supports
-#   optional config input for custom spatial reference or transformation logic.
+#   ArcPy Tool class for generating a BUFFER-style footprint feature class from an Oriented Imagery Dataset (OID).
+#   Utilizes ArcGIS BuildOrientedImageryFootprint and supports optional configuration input for custom spatial reference
+#   or transformation logic. Integrates with project config for workflow consistency and is designed for seamless use
+#   within the RMI 360 workflow.
 #
 # File Location:      /tools/build_oid_footprints_tool.py
-# Uses:
+# Core Utils:
 #   - utils/build_oid_footprints.py
+#   - utils/manager/config_manager.py
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/build_oid_footprints.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/build_oid_footprints.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Parameters:
-#   - Oriented Imagery Dataset {oid_fc} (Feature Class): Path to an existing OID feature class.
-#   - Config File {config_file} (File): Path to the project config.yaml containing spatial reference settings (optional).
+#   - Project Folder {project_folder} (Folder): Root folder for the project; used for resolving logs and asset paths.
+#   - Oriented Imagery Dataset {oid_fc} (Feature Class): Path to an existing OID feature class to generate footprints from.
+#   - Config File {config_file} (File): Path to the project config.yaml containing spatial reference and transformation settings (optional).
 #
 # Notes:
-#   - Can run standalone or as part of the orchestrator workflow
-#   - Respects config overrides for spatial reference and geographic transformation
-#   - Sets canRunInBackground = False due to ArcPy environment handling
+#   - Can run standalone or as part of the orchestrator workflow.
+#   - Respects config overrides for spatial reference and geographic transformation.
+#   - Sets canRunInBackground = False due to ArcPy environment handling.
+#   - Ensure configuration is up-to-date for accurate spatial output.
 # =============================================================================
 
 import arcpy
+
 from utils.build_oid_footprints import build_oid_footprints
+from utils.manager.config_manager import ConfigManager
 
 
 class BuildOIDFootprints(object):
@@ -48,6 +56,18 @@ class BuildOIDFootprints(object):
             A list of ArcPy Parameter objects for the Oriented Imagery Dataset and optional config file.
         """
         params = []
+
+        # Project Folder
+        project_param = arcpy.Parameter(
+            displayName="Project Folder",
+            name="project_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input"
+        )
+        project_param.description = ("Root folder for this Mosaic 360 imagery project. All imagery and logs will be "
+                                     "organized under this folder.")
+        params.append(project_param)
 
         # Oriented Imagery Dataset (OID)
         oid_param = arcpy.Parameter(
@@ -80,12 +100,18 @@ class BuildOIDFootprints(object):
         Extracts input parameters and invokes the core footprint-building function, passing
         the dataset path, optional configuration file, and ArcGIS messaging object.
         """
-        oid_fc = parameters[0].valueAsText
-        config_file = parameters[1].valueAsText
+        project_folder = parameters[0].valueAsText
+        oid_fc = parameters[1].valueAsText
+        config_file = parameters[2].valueAsText
+
+        cfg = ConfigManager.from_file(
+            path=config_file,  # may be None
+            project_base=project_folder,
+            messages=messages
+        )
 
         # Call the core function with ArcGIS Pro messaging support
         build_oid_footprints(
-            oid_fc=oid_fc,
-            config_file=config_file,
-            messages=messages
+            cfg=cfg,
+            oid_fc=oid_fc
         )

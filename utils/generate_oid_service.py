@@ -3,9 +3,10 @@
 # -----------------------------------------------------------------------------
 # Purpose:             Publishes an OID as a hosted Oriented Imagery Service on ArcGIS Online
 # Project:             RMI 360 Imaging Workflow Python Toolbox
-# Version:             1.0.0
+# Version:             1.1.0
 # Author:              RMI Valuation, LLC
-# Created:             2025-05-08
+# Created:             2025-05-14
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Duplicates an existing OID feature class and updates its ImagePath values to point to
@@ -14,12 +15,13 @@
 #   ArcGIS Pro’s `GenerateServiceFromOrientedImageryDataset` tool.
 #
 # File Location:        /utils/generate_oid_service.py
+# Validator:            /utils/validators/generate_oid_service_validator.py
 # Called By:            tools/generate_oid_service_tool.py, tools/process_360_orchestrator.py
-# Int. Dependencies:    config_loader, arcpy_utils, expression_utils
+# Int. Dependencies:    utils/manager/config_manager
 # Ext. Dependencies:    arcpy, arcgis.gis, os, typing
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/generate_oid_service.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/generate_oid_service.md
 #
 # Notes:
 #   - Automatically checks/creates portal folder prior to publishing
@@ -30,58 +32,69 @@ __all__ = ["generate_oid_service"]
 
 import arcpy
 import os
-from typing import Optional, Literal
+from typing import Literal
 from arcgis.gis import GIS
-from utils.config_loader import resolve_config
-from utils.arcpy_utils import log_message
-from utils.expression_utils import resolve_expression
+
+from utils.manager.config_manager import ConfigManager
 
 
-def generate_oid_service(
-        oid_fc: str,
-        config: Optional[dict] = None,
-        config_file: Optional[str] = None,
-        messages=None
-):
+def build_s3_url(bucket, region, bucket_folder, filename):
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{bucket_folder}/{filename}"
+
+def update_oid_image_paths(oid_fc, bucket, region, bucket_folder, logger):
+    updated_count = 0
+    with arcpy.da.UpdateCursor(oid_fc, ["ImagePath"]) as cursor:
+        for row in cursor:
+            local_path = row[0]
+            filename = os.path.basename(local_path)
+            aws_url = build_s3_url(bucket, region, bucket_folder, filename)
+            row[0] = aws_url
+            cursor.updateRow(row)
+            updated_count += 1
+    logger.info(f"Updated {updated_count} image paths to AWS URLs.", indent=2)
+    return updated_count
+
+def assemble_service_metadata(cfg, oid_name):
+    service_name = f"{oid_name}"
+    portal_folder = cfg.resolve(cfg.get("portal.project_folder", ""))
+    share_with: Literal["PRIVATE", "ORGANIZATION", "PUBLIC"] = cfg.get("portal.share_with", "PRIVATE")  # type: ignore
+    add_footprint: Literal["FOOTPRINT", "NO_FOOTPRINT"] = cfg.get("portal.add_footprint", "FOOTPRINT")  # type: ignore
+    tags_list = [cfg.resolve(t) for t in cfg.get("portal.portal_tags", [])]
+    tags_str = ", ".join(tags_list)
+    summary = cfg.resolve(cfg.get("portal.summary", ""))
+    return service_name, portal_folder, share_with, add_footprint, tags_str, summary
+
+def ensure_portal_folder(gis, portal_folder, logger):
+    try:
+        user = gis.users.me
+        existing_folders = [f["title"] for f in user.folders]
+        if portal_folder not in existing_folders:
+            logger.info(f"Portal folder '{portal_folder}' does not exist. Attempting to create it...", indent=2)
+            try:
+                gis.content.folders.create(portal_folder)
+                logger.info(f"✅ Portal folder '{portal_folder}' created successfully.", indent=2)
+            except Exception as e:
+                logger.error(f"Failed to create portal folder '{portal_folder}': {e}", error_type=RuntimeError)
+        else:
+            logger.info(f"📁 Portal folder found: {portal_folder}", indent=2)
+    except Exception as e:
+        logger.warning(f"Unable to check portal folders: {e}", indent=2)
+
+def generate_oid_service(cfg: ConfigManager, oid_fc: str):
     """
     Duplicates an Oriented Imagery Dataset, updates image paths to AWS S3 URLs, and publishes it as a hosted Oriented
     Imagery Service on ArcGIS Online.
-
-    Args:
-        oid_fc: Path to the input Oriented Imagery Dataset feature class.
-        config: Optional dictionary containing configuration parameters.
-        config_file: Optional path to a configuration file.
-        messages: Optional messaging or logging handler.
-
-    Returns:
-        The name of the published Oriented Imagery Service.
-
-    Raises:
-        Re-raises any exceptions encountered during service publishing.
     """
-    log_message("Starting OID Service Generation...", messages, config=config)
-
-    # Load configuration
-    config = resolve_config(
-        config=config,
-        config_file=config_file,
-        oid_fc_path=oid_fc,
-        messages=messages,
-        tool_name="generate_oid_service"
-    )
-
-    aws_cfg = config.get("aws", {})
-    portal_cfg = config.get("portal", {})
+    logger = cfg.get_logger()
+    cfg.validate(tool="generate_oid_service")
+    logger.info("Starting OID Service Generation...", indent=1)
 
     # Required AWS details
-    bucket = aws_cfg.get("s3_bucket")
-    region = aws_cfg.get("region")
-    bucket_folder_expr = aws_cfg.get("s3_bucket_folder")
-    bucket_folder = resolve_expression(bucket_folder_expr, config)
-
+    bucket = cfg.get("aws.s3_bucket")
+    region = cfg.get("aws.region")
+    bucket_folder = cfg.resolve(cfg.get("aws.s3_bucket_folder"))
     if not all([bucket, region, bucket_folder]):
-        log_message("Missing required AWS values in config.yaml", messages, level="error", error_type=ValueError,
-                    config=config)
+        logger.error("Missing required AWS values in config.yaml", error_type=ValueError, indent=2)
 
     # Derive output AWS OID path
     oid_gdb = os.path.dirname(oid_fc)
@@ -91,64 +104,34 @@ def generate_oid_service(
 
     # Step 1: Duplicate the OID feature class
     if arcpy.Exists(aws_oid_fc):
-        log_message(f"Overwriting existing AWS OID: {aws_oid_fc}", messages, config=config)
+        logger.info(f"Overwriting existing AWS OID: {aws_oid_fc}", indent=2)
         arcpy.management.Delete(aws_oid_fc)
-
     arcpy.management.Copy(oid_fc, aws_oid_fc)
-    log_message(f"Duplicated OID to: {aws_oid_fc}", messages, config=config)
+    logger.info(f"Duplicated OID to: {aws_oid_fc}", indent=2)
 
     # Step 2: Update ImagePath values
-    updated_count = 0
-    with arcpy.da.UpdateCursor(aws_oid_fc, ["ImagePath"]) as cursor:
-        for row in cursor:
-            local_path = row[0]
-            filename = os.path.basename(local_path)
-            aws_url = f"https://{bucket}.s3.{region}.amazonaws.com/{bucket_folder}/{filename}"
-            row[0] = aws_url
-            cursor.updateRow(row)
-            updated_count += 1
+    update_oid_image_paths(aws_oid_fc, bucket, region, bucket_folder, logger)
 
-    log_message(f"Updated {updated_count} image paths to AWS URLs.", messages, config=config)
+    # Step 3: Assemble service metadata
+    service_name, portal_folder, share_with, add_footprint, tags_str, summary = assemble_service_metadata(cfg, oid_name)
 
-    # Step 3: Publish using arcpy.oi.GenerateServiceFromOrientedImageryDataset
-    service_name = f"{oid_name}"
-    portal_folder = resolve_expression(portal_cfg.get("project_folder", ""), config)
-    share_with: Literal["PRIVATE", "ORGANIZATION", "PUBLIC"] = portal_cfg.get("share_with", "PRIVATE")  # type: ignore
-    add_footprint: Literal["FOOTPRINT", "NO_FOOTPRINT"] = portal_cfg.get("add_footprint", "FOOTPRINT")  # type: ignore
-    tags_list = [resolve_expression(t, config) for t in portal_cfg.get("portal_tags", [])]
-    tags_str = ", ".join(tags_list)
-    summary = resolve_expression(portal_cfg.get("summary", ""), config)
-
-    # Check if portal folder exists
+    # Step 4: Check/create portal folder
     try:
         gis = GIS("pro")
-        user = gis.users.me
-        existing_folders = [f["title"] for f in user.folders]
-
-        if portal_folder not in existing_folders:
-            log_message(f"⚠️ Portal folder '{portal_folder}' does not exist. Attempting to create it...",
-                        messages, level="warning", config=config)
-            try:
-                gis.content.folders.create(portal_folder)
-                log_message(f"✅ Portal folder '{portal_folder}' created successfully.", messages, config=config)
-            except Exception as e:
-                log_message(f"❌ Failed to create portal folder '{portal_folder}': {e}", messages, level="error",
-                            error_type=RuntimeError, config=config)
-        else:
-            log_message(f"📁 Portal folder found: {portal_folder}", messages, config=config)
+        ensure_portal_folder(gis, portal_folder, logger)
     except Exception as e:
-        log_message(f"⚠️ Unable to check portal folders: {e}", messages, level="warning", config=config)
+        logger.warning(f"Unable to check portal folders: {e}", indent=2)
 
-    # Step 4: Publish using arcpy
-    log_message("📦 Service generation parameters:", messages, config=config)
-    log_message(f"  in_oriented_imagery_dataset: {aws_oid_fc}", messages, config=config)
-    log_message(f"  service_name: {service_name}", messages, config=config)
-    log_message(f"  portal_folder: {portal_folder}", messages, config=config)
-    log_message(f"  share_with: {share_with}", messages, config=config)
-    log_message(f"  add_footprint: {add_footprint}", messages, config=config)
-    log_message("  attach_images: NO_ATTACH", messages, config=config)
-    log_message(f"  tags: {tags_str}", messages, config=config)
-    log_message(f"  summary: {summary}", messages, config=config)
+    # Step 5: Publish using arcpy
+    logger.custom("Service generation parameters:", indent=2, emoji="📦")
+    logger.info(f"in_oriented_imagery_dataset: {aws_oid_fc}", indent=3)
+    logger.info(f"service_name: {service_name}", indent=3)
+    logger.info(f"portal_folder: {portal_folder}", indent=3)
+    logger.info(f"share_with: {share_with}", indent=3)
+    logger.info(f"add_footprint: {add_footprint}", indent=3)
+    logger.info("attach_images: NO_ATTACH", indent=3)
+    logger.info(f"tags: {tags_str}", indent=3)
+    logger.info(f"summary: {summary}", indent=3)
 
     try:
         arcpy.oi.GenerateServiceFromOrientedImageryDataset(
@@ -161,12 +144,9 @@ def generate_oid_service(
             tags=tags_str,
             summary=summary
         )
-        log_message(f"🌐 OID service '{service_name}' published successfully.", messages, config=config)
-
+        logger.success(f"OID service '{service_name}' published successfully.", indent=1)
     except Exception as e:
-        # Print full geoprocessing messages to aid debugging
         gp_messages = arcpy.GetMessages()
-        log_message(f"❌ ArcPy tool failed: {e}\n{gp_messages}", messages, level="warning", config=config)
+        logger.warning(f"ArcPy tool failed: {e}\n{gp_messages}", indent=1)
         raise
-
     return service_name

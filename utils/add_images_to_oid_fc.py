@@ -3,9 +3,10 @@
 # -----------------------------------------------------------------------------
 # Purpose:             Adds geotagged 360° images to an ArcGIS Oriented Imagery Dataset (OID)
 # Project:             RMI 360 Imaging Workflow Python Toolbox
-# Version:             1.0.0
+# Version:             1.1.0
 # Author:              RMI Valuation, LLC
-# Created:             2025-05-08
+# Created:             2025-05-13
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Scans and validates a folder of enhanced/final images, checks for reel_info
@@ -13,108 +14,90 @@
 #   ArcPy’s Oriented Imagery tools. Includes schema validation and recursive support.
 #
 # File Location:        /utils/add_images_to_oid_fc.py
+# Validator:            /utils/validators/add_images_to_oid_validator.py
 # Called By:            tools/add_images_to_oid_tool.py
-# Int. Dependencies:    config_loader, arcpy_utils, expression_utils
-# Ext. Dependencies:    arcpy, os, pathlib, typing
+# Int. Dependencies:    utils/manager/config_manager, utils/shared/expression_utils
+# Ext. Dependencies:    arcpy, pathlib
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/add_images_to_oid.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/add_images_to_oid.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Notes:
 #   - Supports recursive reel folder discovery and duplicate prevention
+#   - Integrates schema validation and status/error logging
 # =============================================================================
 
 __all__ = ["add_images_to_oid"]
 
 import arcpy
-import os
 from pathlib import Path
-from typing import Optional
-from utils.arcpy_utils import log_message
-from utils.config_loader import resolve_config
-from utils.expression_utils import load_field_registry
+
+from utils.manager.config_manager import ConfigManager
+from utils.shared.expression_utils import load_field_registry
 
 
-def warn_if_multiple_reel_info(image_folder, messages=None):
+def warn_if_multiple_reel_info(image_folder, logger):
     """
     Checks for multiple 'reel_info.json' files within the specified image folder and its subfolders.
     
     If more than one 'reel_info.json' file is found, logs an error message listing all detected file paths.
     """
-    reel_info_paths = []
-    # Use pathlib to walk the directory and look for 'reel_info.json' files
-    for json_file in Path(image_folder).rglob("reel_info.json"):  # rglob allows recursive search
-        reel_info_paths.append(str(json_file))
-
+    reel_info_paths = list(image_folder.rglob("reel_info.json"))
     if len(reel_info_paths) > 1:
-        log_message(f"⚠️ Multiple reel_info.json files detected in image folder '{image_folder}':\n"
-                    + "\n".join(reel_info_paths), messages, level="error", error_type=RuntimeError)
+        logger.warning(
+            f"Multiple reel_info.json files detected in image folder '{image_folder}':\n"
+            + "\n".join(str(p) for p in reel_info_paths), indent=1
+        )
 
 
-def add_images_to_oid(
-        project_folder: str,
-        oid_fc_path: str,
-        config: Optional[dict] = None,
-        config_file: Optional[str] = None,
-        messages=None):
+def add_images_to_oid(cfg: ConfigManager, oid_fc_path: str) -> None:
     """
     Adds images from a project folder to an existing Oriented Imagery Dataset (OID).
 
     Resolves configuration to determine the image folder, validates the presence of required files and directories,
     and adds all JPEG images (including those in subfolders) to the specified OID feature class using ArcPy. Logs errors
     if the OID, image folder, or images are missing, and integrates with ArcGIS messaging for status updates.
+
+    Args:
+        cfg: Validated configuration manager.
+        oid_fc_path: Path to the existing OID feature class.
     """
-    config = resolve_config(
-        config=config,
-        config_file=config_file,
-        project_folder=project_folder,
-        oid_fc_path=oid_fc_path,
-        messages=messages,
-        tool_name="add_images_to_oid")
+    logger = cfg.get_logger()
+    cfg.validate(tool="add_images_to_oid")
 
-    folders = config.get("image_output", {}).get("folders", {})
-    image_folder = Path(config["__project_root__"]) / folders.get("parent", "panos") / folders.get("original", "original")
+    image_folder = cfg.paths.original
 
-    warn_if_multiple_reel_info(image_folder, messages=messages)
+    with cfg.get_progressor(total=2, label="Adding images to OID") as progressor:
+        warn_if_multiple_reel_info(image_folder, logger)
 
-    if not arcpy.Exists(oid_fc_path):
-        log_message(f"OID does not exist at path: {oid_fc_path}", messages, level="error", error_type=FileNotFoundError,
-                    config=config)
+        if not arcpy.Exists(oid_fc_path):
+            logger.error(f"OID does not exist at path: {oid_fc_path}", error_type=FileNotFoundError, indent=1)
 
-    if not os.path.isdir(image_folder):
-        log_message(f"Image folder not found: {image_folder}", messages, level="error", error_type=FileNotFoundError,
-                    config=config)
+        if not image_folder.is_dir():
+            logger.error(f"Image folder not found: {image_folder}", error_type=FileNotFoundError, indent=1)
 
-    # Use pathlib to collect all .jpg files recursively
-    jpg_files = list(Path(image_folder).rglob("*.jpg"))
-    if not jpg_files:
-        log_message(f"No .jpg files found in image folder or its subfolders: {image_folder}", messages,
-                    level="error", error_type=RuntimeError, config=config)
+        # Use pathlib to collect all .jpg files recursively
+        jpg_files = list(Path(image_folder).rglob("*.jpg"))
+        if not jpg_files:
+            logger.error(f"No .jpg files found in image folder or its subfolders: {image_folder}", error_type=RuntimeError, indent=1)
 
-    registry_path = (
-        config.get("oid_schema_template", {})
-        .get("esri_default", {})
-        .get("field_registry")
-    )
-    if not registry_path:
-        log_message(
-            "Missing `oid_schema_template.esri_default.field_registry` in config.",
-            messages,
-            level="error",
-            error_type=KeyError,
-            config=config,
-        )
-    registry = load_field_registry(registry_path, config=config)
-    imagery_type = registry.get("OrientedImageryType", {}).get("oid_default", "360")
+        registry = load_field_registry(cfg)
+        imagery_type = registry.get("OrientedImageryType", {}).get("oid_default", "360")
 
-    log_message(f"Adding images from '{image_folder}' (including subfolders) to OID: {oid_fc_path}", messages,
-                config=config)
+        logger.info(f"Adding images from '{image_folder}' (including subfolders) to OID: {oid_fc_path}", indent=1)
+        progressor.update(1)
 
-    arcpy.oi.AddImagesToOrientedImageryDataset(
-        in_oriented_imagery_dataset=oid_fc_path,
-        imagery_category=imagery_type,
-        input_data=[str(image_folder)],
-        include_sub_folders="SUBFOLDERS"
-    )
+        try:
+            arcpy.oi.AddImagesToOrientedImageryDataset(
+                in_oriented_imagery_dataset=oid_fc_path,
+                imagery_category=imagery_type,
+                input_data=[str(image_folder)],
+                include_sub_folders="SUBFOLDERS"
+            )
+            progressor.update(2)
+        except arcpy.ExecuteError as exc:
+            logger.error(f"Failed to add images to OID: {exc}", error_type=RuntimeError, indent=1)
+            return
 
-    log_message("Images successfully added to OID.", messages, config=config)
+    logger.success("Images successfully added to OID.", indent=1)

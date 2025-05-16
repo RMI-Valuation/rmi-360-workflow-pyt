@@ -58,13 +58,17 @@ env/
 *.pyt.*.xml
 
 # Other excluded directories/files
-dev_docs/misc/
 templates/templates.gdb/
 templates/exiftool/Geolocation500/
 /templates/assets/rmi_logo.png
+scratch
+tests
 
 # Binaries
 dist/
 build/
 *.exe
+
+# Development Docs
+dev_docs
 

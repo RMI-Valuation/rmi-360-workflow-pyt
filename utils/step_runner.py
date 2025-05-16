@@ -6,6 +6,7 @@
 # Version:             1.0.0
 # Author:              RMI Valuation, LLC
 # Created:             2025-05-08
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Iterates through workflow step functions, checking for skip conditions, handling wait intervals,
@@ -15,11 +16,11 @@
 #
 # File Location:        /utils/step_runner.py
 # Called By:            tools/process_360_orchestrator.py
-# Int. Dependencies:    arcpy_utils, report_data_builder
-# Ext. Dependencies:    time, datetime, typing
+# Int. Dependencies:    utils/shared/arcpy_utils, utils/shared/report_data_builder, utils/manager/config_manager
+# Ext. Dependencies:    time, datetime, typing, traceback
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/process_360_orchestrator.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/process_360_orchestrator.md
 #
 # Notes:
 #   - Logs each step with emoji-coded status (✅, ❌, ⏭️)
@@ -27,10 +28,13 @@
 # =============================================================================
 
 import time
+import traceback
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
-from utils.arcpy_utils import log_message, backup_oid
-from utils.report_data_builder import save_report_json
+
+from utils.shared.arcpy_utils import backup_oid
+from utils.shared.report_data_builder import save_report_json
+from utils.manager.config_manager import ConfigManager
 
 
 def run_steps(
@@ -39,18 +43,16 @@ def run_steps(
     start_index: int,
     param_values: Dict[str, Any],
     report_data: Dict[str, Any],
-    project_folder: str,
-    config: dict,
-    messages,
+    cfg: ConfigManager,
     wait_config: Optional[dict] = None
 ) -> List[Dict[str, Any]]:
     """
     Executes a sequence of pipeline steps with logging, optional waiting, and OID backups.
-    
+
     Iterates through the specified steps in order, starting from the given index. For each step, checks if it should be
     skipped, optionally performs an OID backup and/or waits before execution, and logs the step's status and timing.
     Updates the report data after each step and saves it to JSON. Stops execution if a step fails.
-    
+
     Args:
         step_funcs: Mapping of step keys to dictionaries containing step metadata, including the function to execute
         and optional skip logic.
@@ -58,82 +60,95 @@ def run_steps(
         start_index: Index in step_order to begin execution.
         param_values: Dictionary of parameters, including ArcPy parameters.
         report_data: Dictionary representing the report, updated incrementally with step results.
-        project_folder: Path to the root project folder.
-        config: Configuration dictionary.
-        messages: ArcGIS messages interface for logging.
+        cfg (ConfigManager): Active configuration object with access to logging and paths.
         wait_config: Optional dictionary controlling waiting and OID backup behavior.
-    
+
     Returns:
         A list of dictionaries, each summarizing the outcome of a step, including status, timing, and notes.
     """
-    results = []
+    logger = cfg.get_logger()
+    results: List[Dict[str, Any]] = []
+
+    def ensure_report_steps(report: Dict[str, Any]) -> None:
+        if "steps" not in report or not isinstance(report["steps"], list):
+            report["steps"] = []
+
+    def append_step_result(report: Dict[str, Any], result: Dict[str, Any]) -> None:
+        ensure_report_steps(report)
+        report["steps"].append(result)
+
+    def should_skip_step(stp: Dict[str, Any], params: Dict[str, Any]) -> Optional[str]:
+        skip_fn = stp.get("skip")
+        if skip_fn:
+            try:
+                return skip_fn(params)
+            except Exception as e:
+                logger.warning(f"Skip-check for '{stp.get('label', '')}' failed: {e}", indent=0)
+                return None
+        return None
+
+    def perform_oid_backup(stp_key: str, params: Dict[str, Any], config: ConfigManager, wait_cfg: Optional[dict]) -> bool:
+        if wait_cfg and wait_cfg.get("backup_oid_between_steps", False):
+            backup_steps = wait_cfg.get("backup_before_step", [])
+            if stp_key in backup_steps:
+                if "oid_fc" not in params:
+                    logger.warning("`oid_fc` not supplied skipping OID backup", indent=1)
+                else:
+                    try:
+                        backup_oid(params["oid_fc"], stp_key, config)
+                        return True
+                    except Exception as e:
+                        logger.warning(f"Failed to back up OID before step '{stp_key}': {e}", 1)
+        return False
+
+    def perform_wait(stp_key: str, lbl: str, wait_cfg: Optional[dict]):
+        if wait_cfg and wait_cfg.get("wait_between_steps", False):
+            wait_steps = wait_cfg.get("wait_before_step", [])
+            wait_seconds = wait_cfg.get("wait_duration_sec", 60)
+            if stp_key in wait_steps:
+                logger.custom(f"Waiting {wait_seconds} seconds before running step: {lbl}", indent=0, emoji="⏳")
+                time.sleep(wait_seconds)
+
+    def execute_step(lbl: str, function, rpt_data: Dict[str, Any], step_key=None):
+        stp_start = datetime.now(timezone.utc)
+        try:
+            with logger.step(lbl, context={"step_key": step_key} if step_key else None):
+                function(report_data=rpt_data)
+            stts = "✅"
+            note = "Success"
+        except Exception as e:
+            stts = "❌"
+            tb = traceback.format_exc()
+            note = f"{e}\n{tb}"
+        stp_end = datetime.now(timezone.utc)
+        elpsd = f"{(stp_end - stp_start).total_seconds():.1f} sec"
+        return stts, note, stp_start, stp_end, elpsd
 
     for step_key in step_order[start_index:]:
         if step_key not in step_funcs:
-            log_message(f"❌ Step '{step_key}' not found in step_funcs dictionary", messages, level="error",
-                        error_type=KeyError, config=config)
+            logger.error(f"Step '{step_key}' not found in step_funcs dictionary", error_type=KeyError, indent=0)
             break
         step = step_funcs[step_key]
         label = step.get("label", step_key)
         func = step["func"]
-        skip_fn = step.get("skip")
-        try:
-            skip_reason = skip_fn(param_values) if skip_fn else None
-        except Exception as e:
-            log_message(f"[WARNING] Skip-check for '{label}' failed: {e}", messages, level="warning", config=config)
-            skip_reason = None
+        skip_reason = should_skip_step(step, param_values)
 
         if skip_reason:
-            log_message(f"⏭️ {label} — {skip_reason}", messages, config=config)
+            logger.custom(f"{label} — {skip_reason}", indent=0, emoji="⏭️")
             step_result = {
                 "name": label,
                 "status": "⏭️",
                 "time": "—",
                 "notes": skip_reason
             }
+            append_step_result(report_data, step_result)
+            save_report_json(report_data, cfg)
             results.append(step_result)
-            report_data["steps"].append(step_result)
-            save_report_json(report_data, project_folder, config, messages)
             continue
 
-        # Optional OID backup before this step
-        backup_occurred = False
-        if wait_config and wait_config.get("backup_oid_between_steps", False):
-            backup_steps = wait_config.get("backup_before_step", [])
-            if step_key in backup_steps:
-                if "oid_fc" not in param_values:
-                    log_message("[WARNING] `oid_fc` not supplied skipping OID backup", messages, level="warning",
-                                config=config)
-                else:
-                    try:
-                        backup_oid(param_values["oid_fc"], step_key, config, messages)
-                        backup_occurred = True
-                    except Exception as e:
-                        log_message(f"[WARNING] Failed to back up OID before step '{step_key}': {e}",
-                                    messages, level="warning", config=config)
-
-        # ⏳ Optional wait before next step
-        if wait_config and wait_config.get("wait_between_steps", False):
-            wait_steps = wait_config.get("wait_before_step", [])
-            wait_seconds = wait_config.get("wait_duration_sec", 60)
-            if step_key in wait_steps:
-                log_message(f"⏳ Waiting {wait_seconds} seconds before running step: {label}", messages, config=config)
-                time.sleep(wait_seconds)
-
-        log_message(f"▶️ {label}", messages, config=config)
-        step_start = datetime.now(timezone.utc)
-
-        try:
-            func()
-            status = "✅"
-            notes = "Success"
-        except Exception as e:
-            status = "❌"
-            notes = f"{e}"
-            log_message(f"[ERROR] {label} failed: {e}", messages, level="error", config=config)
-
-        step_end = datetime.now(timezone.utc)
-        elapsed = f"{(step_end - step_start).total_seconds():.1f} sec"
+        backup_occurred = perform_oid_backup(step_key, param_values, cfg, wait_config)
+        perform_wait(step_key, label, wait_config)
+        status, notes, step_start, step_end, elapsed = execute_step(label, func, report_data, step_key=step_key)
 
         step_result = {
             "name": label,
@@ -143,18 +158,11 @@ def run_steps(
             "time": elapsed,
             "notes": notes + (" (OID backup created before step)" if backup_occurred else "")
         }
-
         if backup_occurred:
             step_result["backup_created"] = "true"
-
+        append_step_result(report_data, step_result)
+        save_report_json(report_data, cfg)
         results.append(step_result)
-        report_data["steps"].append(step_result)
-
-        # ✅ Save current state to JSON after each step
-        save_report_json(report_data, project_folder, config, messages)
-
-        # If the step failed, stop execution (optional; remove if continuing is preferred)
         if status == "❌":
             break
-
     return results

@@ -3,42 +3,47 @@
 # -----------------------------------------------------------------------------
 # Tool Name:          AddImagesToOIDTool
 # Toolbox Context:    rmi_360_workflow.pyt
-# Version:            1.0.0
+# Version:            1.1.0
 # Author:             RMI Valuation, LLC
 # Created:            2025-05-08
+# Last Updated:       2025-05-15
 #
 # Description:
-#   Implements ArcPy Tool class for adding 360° images to an existing Oriented Imagery Dataset (OID).
-#   Also assigns group indices and enriches OID attributes after insertion. Uses project config
-#   settings for source folders, schema enforcement, and vertical offset control.
+#   ArcPy Tool class for adding rendered 360° images to an existing Oriented Imagery Dataset (OID).
+#   Assigns group indices and enriches OID attributes after insertion. Uses project configuration
+#   for source folders, schema enforcement, and vertical offset control. Ensures compatibility with
+#   CORE utils and project schema templates. Designed for robust integration into the RMI 360 workflow.
 #
 # File Location:      /tools/add_images_to_oid_tool.py
-# Uses:
+# Core Utils:
 #   - utils/add_images_to_oid_fc.py
 #   - utils/assign_group_index.py
 #   - utils/calculate_oid_attributes.py
-#   - utils/config_loader.py
+#   - utils/manager/config_manager.py
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/add_images_to_oid.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/add_images_to_oid.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Parameters:
-#   - Project Folder {project_folder} (Folder): Root folder for this Mosaic 360 imagery project.
-#   - Oriented Imagery Dataset {oid_fc} (Feature Class): Existing OID feature class to which images will be added.
-#   - Adjust Z (Apply Offset) {adjust_z} (Boolean): Whether to apply vertical offset to GPS elevation using config.
-#   - Config File {config_file} (File): Path to YAML config file. Optional; uses default if not provided.
+#   - Project Folder {project_folder} (Folder): Root folder for the Mosaic 360 imagery project.
+#   - Oriented Imagery Dataset {oid_fc} (Feature Class): OID feature class to which images will be added.
+#   - Adjust Z (Apply Offset) {adjust_z} (Boolean): If True, applies vertical offset to GPS elevation using config.
+#   - Config File {config_file} (File): YAML config file. Optional; uses default if not provided.
 #
 # Notes:
-#   - Conditionally applies GroupIndex and orientation enrichment
-#   - Overwrites output feature class if it exists (arcpy.env.overwriteOutput = True)
-#   - Designed to work with pre-built schema templates
+#   - Applies GroupIndex and orientation enrichment if configured in project settings.
+#   - Overwrites output feature class if it exists (arcpy.env.overwriteOutput = True).
+#   - Designed for use with schema templates and robust error handling.
+#   - Ensure documentation is kept current with tool updates.
 # =============================================================================
 
 import arcpy
+
 from utils.add_images_to_oid_fc import add_images_to_oid
 from utils.calculate_oid_attributes import enrich_oid_attributes
-from utils.config_loader import get_default_config_path
 from utils.assign_group_index import assign_group_index
+from utils.manager.config_manager import ConfigManager
 
 
 class AddImagesToOIDTool(object):
@@ -123,25 +128,27 @@ class AddImagesToOIDTool(object):
         project_folder = parameters[0].valueAsText
         oid_fc = parameters[1].valueAsText
         adjust_z = bool(parameters[2].value) if parameters[2].value is not None else True
-        config_file = parameters[3].valueAsText or get_default_config_path()
+        config_file = parameters[3].valueAsText
 
-        add_images_to_oid(
-            project_folder=project_folder,
-            oid_fc_path=oid_fc,
-            config_file=config_file,
+        cfg = ConfigManager.from_file(
+            path=config_file,               # May be None
+            project_base=project_folder,
             messages=messages
         )
 
+        add_images_to_oid(
+            cfg=cfg,
+            oid_fc_path=oid_fc
+        )
+
         assign_group_index(
-            oid_fc_path=oid_fc,
-            config_file=config_file,
-            messages=messages
+            cfg=cfg,
+            oid_fc_path=oid_fc
         )
 
         # Enrich added records with Z-adjusted, derived, and default fields
         enrich_oid_attributes(
+            cfg=cfg,
             oid_fc_path=oid_fc,
-            config_file=config_file,
-            messages=messages,
             adjust_z=adjust_z
         )

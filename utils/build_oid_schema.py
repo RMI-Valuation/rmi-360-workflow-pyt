@@ -6,6 +6,7 @@
 # Version:             1.0.0
 # Author:              RMI Valuation, LLC
 # Created:             2025-05-08
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Builds a geodatabase table to serve as a schema template for OID creation. It integrates
@@ -13,12 +14,14 @@
 #   of existing templates, schema validation, and writes fields using ArcPy management tools.
 #
 # File Location:        /utils/build_oid_schema.py
+# Validator:            /utils/validators/build_oid_schema_validator.py
 # Called By:            tools/create_oid_template_tool.py
-# Int. Dependencies:    config_loader, expression_utils, arcpy_utils, schema_paths
+# Int. Dependencies:    utils/manager/config_manager, utils/shared/expression_utils
 # Ext. Dependencies:    arcpy, os, datetime, typing
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/create_oid_and_schema.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/create_oid_and_schema.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Notes:
 #   - Respects categories (standard, not_applicable) from registry
@@ -30,109 +33,95 @@ __all__ = ["create_oid_schema_template"]
 import arcpy
 import os
 from datetime import datetime
-from typing import Optional
-from utils.config_loader import resolve_config
-from utils.expression_utils import load_field_registry
-from utils.arcpy_utils import log_message
-from utils.schema_paths import resolve_schema_template_paths
+from typing import Optional, Callable, Any, cast
 
+from utils.manager.config_manager import ConfigManager
+from utils.shared.expression_utils import load_field_registry
+from utils.validators.common_validators import EsriFieldType
+
+
+def _field_tuple(f: dict) -> tuple[str, str, Optional[int], str]:
+    return (
+        f["name"],
+        f["type"],
+        f.get("length"),
+        f.get("alias", f["name"])
+    )
 
 def create_oid_schema_template(
-        config: Optional[dict] = None,
-        config_file: Optional[str] = None,
-        messages=None) -> str:
+    cfg: ConfigManager,
+    *,
+    arcpy_mod=None,
+    os_mod=None,
+    registry_loader: Optional[Callable[..., dict]] = None,
+    logger: Optional[Any] = None
+) -> str:
     """
     Creates a schema template table for Oriented Imagery Datasets (OIDs) using configuration and field registry files.
 
-    The function generates a geodatabase table with fields defined by a YAML configuration and a field registry. It
-    ensures the output directory and geodatabase exist, backs up any existing schema template, and adds fields from
-    both the registry and configuration groups. Returns the full path to the created schema template table.
-
     Args:
-        config: Optional configuration dictionary. If not provided, loaded from config_file.
-        config_file: Optional path to a configuration YAML file.
-        messages: Optional messaging or logging handler.
-
+        cfg: Validated configuration manager.
+        arcpy_mod: Optional arcpy module for test injection.
+        os_mod: Optional os module for test injection.
+        registry_loader: Optional loader for field registry.
+        logger: Optional logger for test injection.
     Returns:
         The full path to the created schema template table.
-
     Raises:
         ValueError: If the required field registry path is missing in the configuration.
     """
-    config = resolve_config(
-        config=config,
-        config_file=config_file,
-        messages=messages,
-        tool_name="build_oid_schema")
+    arcpy_mod = arcpy_mod or arcpy
+    os_mod = os_mod or os
+    registry_loader = registry_loader or load_field_registry
+    logger = logger or cfg.get_logger()
+    cfg.validate(tool="build_oid_schema")
+    paths = cfg.paths
+    esri_cfg = cfg.get("oid_schema_template.esri_default", {})
+    try:
+        if not os_mod.path.exists(paths.templates):
+            os_mod.makedirs(paths.templates, exist_ok=True)
+        if not arcpy_mod.Exists(paths.oid_schema_gdb):
+            arcpy_mod.management.CreateFileGDB(paths.templates, os_mod.path.basename(paths.oid_schema_gdb))
+        if arcpy_mod.Exists(paths.oid_schema_template_path):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{paths.oid_schema_template_name}_{timestamp}"
+            arcpy_mod.management.Rename(paths.oid_schema_template_path, backup_name)
+            logger.info(f"Existing schema template found and backed up as: {backup_name}", indent=0)
+        arcpy_mod.management.CreateTable(paths.oid_schema_gdb, paths.oid_schema_template_path)
+        fields: list[tuple[str, str, Optional[int], str]] = []
 
-    paths = resolve_schema_template_paths(config)
-    esri_cfg = config.get("oid_schema_template", {}).get("esri_default", {})
+        # Load registry-defined fields (assumes prior validation)
+        for category in ("standard", "not_applicable"):
+            if esri_cfg.get(category, True):
+                entries = registry_loader(cfg, category_filter=category)
+                if not entries:
+                    logger.debug(f"No fields loaded for category: {category}", indent=1)
+                for f in entries.values():
+                    fields.append(_field_tuple(f))
 
-    if not os.path.exists(paths.templates_dir):
-        os.makedirs(paths.templates_dir, exist_ok=True)
-    if not arcpy.Exists(paths.gdb_path):
-        arcpy.management.CreateFileGDB(paths.templates_dir, os.path.basename(paths.gdb_path))
-
-    if arcpy.Exists(paths.output_path):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{paths.template_name}_{timestamp}"
-        arcpy.management.Rename(paths.output_path, backup_name)
-        log_message(f"⚠️ Existing schema template found and backed up as: {backup_name}", messages, config=config)
-
-    arcpy.management.CreateTable(paths.gdb_path, paths.template_name)
-
-    fields = []
-
-    # Load from registry
-    registry_path = esri_cfg.get("field_registry")
-    if not registry_path:
-        log_message("Missing required key: oid_schema_template.esri_default.field_registry", messages, level="error",
-                    error_type=ValueError, config=config)
-
-    for category in ("standard", "not_applicable"):
-        if esri_cfg.get(category, True):
-            entries = load_field_registry(registry_path, config=config, category_filter=category)
-            if not entries:
-                if category == "standard":
-                    log_message(f"Failed to load required {category} fields from registry: {registry_path}", messages,
-                                level = "error", error_type = ValueError, config = config)
-                else:
-                    log_message(f"No {category} fields found in registry: {registry_path}", messages,
-                                level = "warning", config = config)
-                    continue
-            for f in entries.values():
-                fields.append((f["name"], f["type"], f.get("length", None), f.get("alias", f["name"])))
-
-    # Add config-defined fields
-    for group in ["mosaic_fields", "grp_idx_fields", "linear_ref_fields", "custom_fields"]:
-        block = config.get("oid_schema_template", {}).get(group, {})
-        for _key, f in block.items():
-            if not isinstance(f, dict) or "name" not in f or "type" not in f:
-                log_message(f"⚠️ Invalid field configuration in {group}.{_key}: missing required keys",
-                            messages, level="warning", config=config)
-                continue
-            fields.append((f["name"], f["type"], f.get("length"), f.get("alias", f["name"])))
-
-    # Valid ArcGIS field types
-    VALID_FIELD_TYPES = {"TEXT", "FLOAT", "DOUBLE", "SHORT", "LONG", "DATE", "BLOB", "RASTER", "GUID", "GLOBALID", "XML"}
-
-    for name, ftype, length, alias in fields:
-        if ftype not in VALID_FIELD_TYPES:
-            log_message(f"⚠️ Invalid field type '{ftype}' for field '{name}', skipping", messages,
-                        level = "warning", config = config)
-            continue
-        if not arcpy.ListFields(paths.output_path, name):
-            try:
-                arcpy.management.AddField(
-                    in_table=paths.output_path,
-                    field_name=name,
-                    field_type=ftype,
-                    field_length=length,
-                    field_alias=alias,
-                    field_is_nullable="NULLABLE"
-                )
-            except arcpy.ExecuteError as e:
-                log_message(f"⚠️ Failed to add field {name} to schema: {e}", messages, level="warning", config=config)
-
-    log_message(f"✅ OID schema template table created: {paths.output_path}", messages, config=config)
-    return paths.output_path
+        # Add config-defined fields
+        for group in ["mosaic_fields", "grp_idx_fields", "linear_ref_fields", "custom_fields"]:
+            block = cfg.get(f"oid_schema_template.{group}", {})
+            for f in block.values():
+                fields.append(_field_tuple(f))
+        added_fields = 0
+        for name, ftype, length, alias in fields:
+            field_type = cast(EsriFieldType, ftype)
+            if not arcpy_mod.ListFields(paths.oid_schema_template_path, name):
+                try:
+                    arcpy_mod.management.AddField(
+                        in_table=paths.oid_schema_template_path,
+                        field_name=name,
+                        field_type=field_type,
+                        field_length=length,
+                        field_alias=alias,
+                        field_is_nullable="NULLABLE"
+                    )
+                    added_fields += 1
+                except Exception as e:
+                    logger.warning(f"Failed to add field '{name}' (type={ftype}, length={length}) to schema: {e}", indent=1)
+        logger.success(f"OID schema template table created: {paths.oid_schema_template_path} with {added_fields} fields.", indent=0)
+        return paths.oid_schema_template_path
+    except Exception as e:
+        logger.error(f"Failed to create OID schema template: {e}", indent=0)
+        raise

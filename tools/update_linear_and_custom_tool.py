@@ -3,24 +3,28 @@
 # -----------------------------------------------------------------------------
 # Tool Name:          UpdateLinearAndCustomTool
 # Toolbox Context:    rmi_360_workflow.pyt
-# Version:            1.0.0
+# Version:            1.1.0
 # Author:             RMI Valuation, LLC
 # Created:            2025-05-08
+# Last Updated:       2025-05-15
 #
 # Description:
-#   Implements ArcPy Tool class to assign Milepost (MP) values and route identifiers via linear referencing
+#   ArcPy Tool class to assign Milepost (MP) values and route identifiers via linear referencing
 #   against an M-enabled centerline. Also supports applying user-defined attribute fields based on config
 #   expressions. Can selectively enable or skip linear referencing while always applying custom fields.
+#   Integrates with Core Utils for attribute enrichment and configuration management.
 #
 # File Location:      /tools/update_linear_and_custom_tool.py
-# Uses:
+# Core Utils:
 #   - utils/update_linear_and_custom.py
-#   - utils/config_loader.py
+#   - utils/manager/config_manager.py
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/update_linear_and_custom.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/update_linear_and_custom.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Parameters:
+#   - Project Folder {project_folder} (Folder): Root folder for the project; used for resolving logs and asset paths.
 #   - Oriented Imagery Dataset (OID) {oid_fc} (Feature Class): OID feature class containing image points to enrich.
 #   - M-Enabled Centerline {centerline_fc} (Feature Class): Line feature class with calibrated M-values for referencing.
 #   - Route ID Field {route_id_field} (Field): Field in the centerline that uniquely identifies each route.
@@ -28,13 +32,14 @@
 #   - Config File {config_file} (File): Path to the project config.yaml file with custom field logic.
 #
 # Notes:
-#   - Linear referencing can be toggled independently of custom attribute updates
-#   - Supports complex config-driven field population with modifiers and formatting
+#   - Linear referencing can be toggled independently of custom attribute updates.
+#   - Supports complex config-driven field population with modifiers and formatting.
+#   - Ensure config file and Core Utils are up-to-date for accurate attribute enrichment.
 # =============================================================================
 
 import arcpy
 from utils.update_linear_and_custom import update_linear_and_custom
-from utils.config_loader import get_default_config_path
+from utils.manager.config_manager import ConfigManager
 
 
 class UpdateLinearAndCustomTool(object):
@@ -46,6 +51,18 @@ class UpdateLinearAndCustomTool(object):
 
     def getParameterInfo(self):
         params = []
+
+        # Project Folder
+        project_param = arcpy.Parameter(
+            displayName="Project Folder",
+            name="project_folder",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input"
+        )
+        project_param.description = ("Root folder for this Mosaic 360 imagery project. All imagery and logs will be "
+                                     "organized under this folder.")
+        params.append(project_param)
 
         oid_param = arcpy.Parameter(
             displayName="Oriented Imagery Dataset (OID)",
@@ -107,17 +124,23 @@ class UpdateLinearAndCustomTool(object):
         return params
 
     def execute(self, parameters, messages):
-        oid_fc = parameters[0].valueAsText
-        centerline_fc = parameters[1].valueAsText
-        route_id_field = parameters[2].valueAsText
-        enable_linear_ref = parameters[3].value if parameters[3].value is not None else True
-        config_file = parameters[4].valueAsText or get_default_config_path()
+        project_folder = parameters[0].valueAsText
+        oid_fc = parameters[1].valueAsText
+        centerline_fc = parameters[2].valueAsText
+        route_id_field = parameters[3].valueAsText
+        enable_linear_ref = parameters[4].value if parameters[3].value is not None else True
+        config_file = parameters[5].valueAsText
+
+        cfg = ConfigManager.from_file(
+            path=config_file,  # may be None
+            project_base=project_folder,
+            messages=messages
+        )
 
         update_linear_and_custom(
-            oid_fc=oid_fc,
+            cfg=cfg,
+            oid_fc_path=oid_fc,
             centerline_fc=centerline_fc,
             route_id_field=route_id_field,
-            enable_linear_ref=enable_linear_ref,
-            config_file=config_file,
-            messages=messages
+            enable_linear_ref=enable_linear_ref
         )

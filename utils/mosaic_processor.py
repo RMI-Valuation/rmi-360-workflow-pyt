@@ -3,31 +3,35 @@
 # -----------------------------------------------------------------------------
 # Purpose:             Executes Mosaic Processor CLI to render, fix reels, and integrate GPS metadata
 # Project:             RMI 360 Imaging Workflow Python Toolbox
-# Version:             1.0.0
+# Version:             1.1.0
 # Author:              RMI Valuation, LLC
-# Created:             2025-05-08
+# Created:             2025-05-13
+# Last Updated:        2025-05-15
 #
 # Description:
-#   Invokes the Mosaic Processor executable in two passes: one for rendering and reel fixing, and one for GPX
-#   integration. Constructs shell-safe command lines, manages output folders, detects reel numbers, logs output,
-#   and writes reel metadata. Uses subprocess for shell execution and logs all results for diagnostics.
+#   Runs the Mosaic Processor in three sequential stages:
+#   1. Render + Reel Fix
+#   2. Frame number zero-padding
+#   3. GPX metadata integration
+#   Logs progress, validates config, and writes a single reel_info.json (optional).
 #
 # File Location:        /utils/mosaic_processor.py
+# Validator:            /utils/validators/mosaic_processor_validator.py
 # Called By:            tools/run_mosaic_processor_tool.py, tools/process_360_orchestrator.py
-# Int. Dependencies:    config_loader, arcpy_utils, pad_mosaic_frame_numbers, path_utils
+# Int. Dependencies:    utils/manager/config_manager
 # Ext. Dependencies:    subprocess, json, re, os, typing, pathlib
 # External Tools:       Mosaic Processor CLI, MistikaVR (external dependency)
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/run_mosaic_processor.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/run_mosaic_processor.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Notes:
-#   - .cfg path is reserved for future functionality
-#   - Fails fast on missing .grp or invalid input folder
+#   - Uses cfg.validate(tool="mosaic_processor") for schema enforcement
+#   - .cfg file support is reserved for future implementation
+#   - Output is auto-padded to 6-digit frame numbers post-render
+#
 # =============================================================================
-
-__all__ = ["run_mosaic_processor"]
-
 import os
 import subprocess
 import json
@@ -35,16 +39,21 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from utils.config_loader import resolve_config
-from utils.pad_mosaic_frame_numbers import pad_frame_numbers
-from utils.arcpy_utils import log_message
-from utils.path_utils import get_log_path
+from utils.manager.config_manager import ConfigManager
+
+__all__ = ["run_mosaic_processor"]
 
 
 def build_mosaic_command(
-    exe_path, input_dir, output_dir, grp_path,
-    start_frame=None, end_frame=None,
-    skip_gpx=False, skip_render=False, skip_reel_fix=False,
+    exe_path,
+    input_dir,
+    output_dir,
+    grp_path,
+    start_frame=None,
+    end_frame=None,
+    skip_gpx=False,
+    skip_render=False,
+    skip_reel_fix=False,
     wrap_in_shell: bool = True
 ):
     """
@@ -94,65 +103,126 @@ def build_mosaic_command(
         return cmd
 
 
-def run_render_stage(exe_path, input_dir, output_dir, grp_path, start_frame, end_frame, exe_dir, log_f, messages, config, log_path):
-    """Run the Render + Reel Fix stage."""
-    render_cmd = build_mosaic_command(exe_path, input_dir, str(output_dir), grp_path, start_frame, end_frame,
-                                      skip_gpx=True, wrap_in_shell=True)
-    log_message(f"🛠️ Running command: {render_cmd}", messages, level="debug", config=config)
-    log_f.write(f"COMMAND: {render_cmd}\n\n")
+def run_processor_stage(
+    cfg: ConfigManager,
+    input_dir: str,
+    output_dir: Path,
+    start_frame,
+    end_frame,
+    log_f,
+    log_path,
+    stage_name: str,
+    skip_render=False,
+    skip_reel_fix=False,
+    skip_gpx=False,
+) -> bool:
+    """
+    Runs a single Mosaic Processor CLI stage (Render or GPX Integration).
 
-    result1 = subprocess.run(render_cmd, cwd=exe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, shell=True)
+    Args:
+        cfg: ConfigManager instance.
+        input_dir: Input directory containing raw frames.
+        output_dir: Target output directory.
+        start_frame: Start frame (optional).
+        end_frame: End frame (optional).
+        log_f: File handle for writing logs.
+        log_path: Path to log file.
+        stage_name: Label for the stage ("Render + Reel Fix" or "GPX Integration").
+        skip_render: If True, disables rendering.
+        skip_reel_fix: If True, disables reel fixing.
+        skip_gpx: If True, disables GPX integration.
 
-    log_f.write("=== Render + Reel Fix ===\n")
-    log_f.write(result1.stdout or "")
+    Returns:
+        True if stage succeeded, False otherwise.
+    """
+    logger = cfg.get_logger()
+    exe_path = cfg.paths.mosaic_processor_exe
+    grp_path = cfg.paths.mosaic_processor_grp
+    cfg_path = cfg.paths.mosaic_processor_cfg
+    exe_dir = os.path.dirname(exe_path)
+
+    if cfg_path != "DISABLED":
+        logger.warning(f"Note: cfg_path is not yet implemented. Provided value: {cfg_path}", indent=1)
+
+    cmd = build_mosaic_command(
+        exe_path=exe_path,
+        input_dir=input_dir,
+        output_dir=str(output_dir),
+        grp_path=grp_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        skip_gpx=skip_gpx,
+        skip_render=skip_render,
+        skip_reel_fix=skip_reel_fix,
+        wrap_in_shell=True,
+    )
+
+    logger.custom(f"Running command: {cmd}", indent=2, emoji="🧑🏻‍💻")
+    log_f.write(f"COMMAND: {cmd}\n\n")
+
+    result = subprocess.run(cmd, cwd=exe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=True)
+
+    logger.success(f"=== {stage_name} Complete ===", indent=1)
+    log_f.write(f"=== {stage_name} ===\n")
+    log_f.write(result.stdout or "")
     log_f.write("\n\n")
 
-    if result1.returncode != 0:
-        log_message("❌ Render failed. See log for details.", messages, level="error", error_type=RuntimeError,
-                    config=config)
-        log_message(f"📄 Log written to: {log_path}", messages, config=config)
-        return False  # Return False if failed
+    if result.returncode != 0:
+        logger.error(f"{stage_name} failed. See log for details.", error_type=RuntimeError, indent=0)
+        logger.info(f"📄 Log written to: {log_path}", indent=1)
+        return False
 
-    return True  # Return True if successful
+    return True
 
 
-def run_gpx_integration_stage(exe_path, input_dir, output_dir, grp_path, start_frame, end_frame, exe_dir, log_f, messages, config, log_path):
-    """Run the GPX Integration stage."""
-    gpx_cmd = build_mosaic_command(exe_path, input_dir, str(output_dir), grp_path, start_frame, end_frame,
-                                   skip_render=True, skip_reel_fix=True, wrap_in_shell=True)
-    log_message(f"🛠️ Running command: {gpx_cmd}", messages, level="debug", config=config)
-    log_f.write(f"COMMAND: {gpx_cmd}\n\n")
+def pad_frame_numbers(output_dir: str, logger) -> int:
+    """
+    Renames JPG files in the output folder to use zero-padded 6-digit frame numbers.
 
-    result2 = subprocess.run(gpx_cmd, cwd=exe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             shell=True)
+    Args:
+        output_dir: Directory containing frame image files.
+        logger: ConfigManager logger instance.
 
-    log_f.write("=== GPX Integration ===\n")
-    log_f.write(result2.stdout or "")
-    log_f.write("\n\n")
+    Returns:
+        Number of files renamed.
+    """
+    renamed_count = 0
+    logger.info(f"Checking for frame number padding in: {output_dir}", indent=2)
 
-    if result2.returncode != 0:
-        log_message("❌ GPX Integration failed. See log for details.", messages, level="error",
-                    error_type=RuntimeError, config=config)
-        log_message(f"📄 Log written to: {log_path}", messages, config=config)
-        return False  # Return False if failed
+    padded = False  # TODO: Add support for checking if frame numbers are padded (Check if any file has a 6-digit frame number)
+    if not padded:
+        logger.info("Frame numbers are not padded, padding...", indent=3)
+    else:
+        logger.info("Frame numbers are padded. Skipping padding.", indent=3)
 
-    return True  # Return True if successful
+    for root, dirs, files in os.walk(output_dir):
+        for f in files:
+            if f.lower().endswith(".jpg"):
+                match = re.match(r"^(.*_)(\d+)\.jpg$", f)
+                if match:
+                    prefix, num = match.groups()
+                    if len(num) < 6:
+                        padded = num.zfill(6)
+                        new_name = f"{prefix}{padded}.jpg"
+                        old_path = os.path.join(root, f)
+                        new_path = os.path.join(root, new_name)
+                        os.rename(old_path, new_path)
+                        renamed_count += 1
+                        logger.debug(f"Renamed: {f} → {new_name}", indent=4)
+
+    logger.info(f"Total files padded: {renamed_count}", indent=3)
+    logger.success("=== Pad frame numbers Complete ===", indent=1)
+    return renamed_count
 
 
 def run_mosaic_processor(
-    project_folder: str,
+    cfg: ConfigManager,
     input_dir: str,
-    grp_path: Optional[str] = None,
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
-    exe_path: Optional[str] = None,
-    config: Optional[dict] = None,
-    config_file: Optional[str] = None,
-    messages=None
 ) -> None:
     """
-    Runs the Mosaic Processor workflow for a project in two sequential stages.
+    Runs the Mosaic Processor workflow for a project in three sequential stages.
     
     This function orchestrates the execution of the Mosaic Processor executable, first performing rendering and reel
     fixing, then running GPX integration. It handles configuration resolution, validates required paths, manages output
@@ -160,50 +230,21 @@ def run_mosaic_processor(
     critical step fails, the function logs an error and exits early.
     
     Args:
-        project_folder: Path to the project folder containing configuration and output directories.
+        cfg (ConfigManager): Active configuration manager with logging and paths.
         input_dir: Directory containing input image frames.
-        grp_path: Optional path to the .grp calibration file; overrides config if provided.
         start_frame: Optional starting frame number for processing.
         end_frame: Optional ending frame number for processing.
-        exe_path: Optional path to the Mosaic Processor executable; overrides config if provided.
-        config: Optional preloaded and validated configuration dictionary.
-        config_file: Optional path to a configuration YAML file (used if config is not provided).
-        messages: Optional ArcPy messaging object for logging.
-    
     """
-    config = resolve_config(
-        config=config,
-        config_file=config_file,
-        project_folder=project_folder,
-        messages=messages,
-        tool_name="mosaic_processor")
+    logger = cfg.get_logger()
+    cfg.validate(tool="mosaic_processor")
 
-    folders = config.get("image_output", {}).get("folders", {})
-    output_dir = Path(project_folder) / folders.get("parent", "panos") / folders.get("original", "original")
-    os.makedirs(output_dir, exist_ok=True)
-
-    proc_cfg = config.get("executables", {}).get("mosaic_processor", {})
-    exe_path = exe_path or proc_cfg.get("exe_path")
-    if not exe_path:
-        log_message("❌ Mosaic Processor executable path is missing in config.", messages, level="error",
-                    error_type=ValueError, config=config)
-    exe_dir = os.path.dirname(exe_path)
-
-    grp_path = grp_path or proc_cfg.get("grp_path")
-    if not grp_path:
-        log_message("❌ .grp calibration file path is missing in config.", messages, level="error",
-                    error_type=ValueError, config=config)
-
-    cfg_path = proc_cfg.get("cfg_path")  # Currently unused, but included for FUTURE FUNCTIONALITY
-    if cfg_path and cfg_path != "DISABLED":
-        log_message(f"⚠️ Note: cfg_path is not yet implemented. Provided value: {cfg_path}", messages, level="warning",
-                    config=config)
+    output_dir = cfg.paths.original
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not os.path.isdir(input_dir):
-        log_message(f"Input folder does not exist: {input_dir}", messages, level="error", error_type=FileNotFoundError,
-                    config=config)
+        logger.error(f"Input folder does not exist: {input_dir}", error_type=FileNotFoundError, indent=1)
 
-    # === DETECT REEL NUMBER (if processing a single reel) ===
+    # Optional: write reel_info.json if a reel folder name can be inferred
     reel_match = re.search(r"reel_(\d{4})", os.path.basename(input_dir), re.IGNORECASE)
     if reel_match:
         reel_number = reel_match.group(1)
@@ -211,35 +252,51 @@ def run_mosaic_processor(
         try:
             with open(reel_info_path, "w") as f:
                 json.dump({"reel": reel_number}, f)
-            log_message(f"Saved reel number {reel_number} to {reel_info_path}", messages, config=config)
+            logger.info(f"Saved reel number {reel_number} to {reel_info_path}", indent=1)
         except Exception as e:
-            log_message(f"WARNING: Failed to write reel_info.json to {reel_info_path}: {e}", messages,
-                        level="warning", config=config)
+            logger.warning(f"Failed to write reel_info.json to {reel_info_path}: {e}", indent=1)
 
-    # === Prepare log file ===
-    log_path = get_log_path("mosaic_processor_log", config)
+    log_path = cfg.paths.get_log_file_path("mosaic_processor_log", cfg)
 
     try:
-        with open(log_path, "w", encoding="utf-8") as log_f:
+        with open(log_path, "w", encoding="utf-8") as log_f, \
+                cfg.get_progressor(total=3, label="Mosaic Processor Workflow") as progressor:
+
             # === Step 1: Render + Reel Fix ===
-            log_message("Running Mosaic Processor: Render + Reel Fix...", messages, config=config)
-            if not run_render_stage(exe_path, input_dir, output_dir, grp_path, start_frame, end_frame, exe_dir, log_f,
-                                    messages, config, log_path):
-                return  # Exit if render stage fails
+            logger.info("=== Render + Reel Fix Started ===", indent=1)
+            number_of_reels = len(os.listdir(input_dir))  # TODO: Is this the best way to get the number of reels? (just need to get number of folders in input_dir)
+            logger.info(f"Found {number_of_reels} reel(s) in {input_dir}", indent=2)
+
+            # TODO get folder names from input_dir and add logger.info for each folder
+            for folder in os.listdir(input_dir):
+                logger.info(f"🎞️ {folder}", indent=3)
+            if not run_processor_stage(
+                    cfg, input_dir, output_dir, start_frame, end_frame,
+                    log_f, log_path,
+                    stage_name="Render + Reel Fix",
+                    skip_gpx=True
+            ):
+                return
+            progressor.update(1)
 
             # === Step 2: Pad frame numbers ===
-            log_message("Checking and renaming frame numbers if needed...", messages, config=config)
-            pad_frame_numbers(str(output_dir), messages)
+            logger.info("=== Pad frame numbers Started ===", indent=1)
+            pad_frame_numbers(str(output_dir), logger)
+            progressor.update(2)
 
             # === Step 3: GPX Integration ===
-            log_message("Running Mosaic Processor: GPX Integration...", messages, config=config)
-            if not run_gpx_integration_stage(exe_path, input_dir, output_dir, grp_path, start_frame, end_frame, exe_dir,
-                                             log_f, messages, config, log_path):
-                return  # Exit if GPX integration fails
+            logger.info("=== GPX Integration Started ===", indent=1)
+            if not run_processor_stage(
+                    cfg, input_dir, output_dir, start_frame, end_frame,
+                    log_f, log_path,
+                    stage_name="GPX Integration",
+                    skip_render=True,
+                    skip_reel_fix=True
+            ):
+                return
+            progressor.update(3)
 
     except Exception as e:
-        log_message(f"❌ Error during Mosaic Processor workflow: {e}", messages, level="error", error_type=RuntimeError,
-                    config=config)
+        logger.error(f"Error during Mosaic Processor workflow: {e}", error_type=RuntimeError, indent=1)
 
-    log_message("✅ Mosaic Processor workflow complete.", messages, config=config)
-    log_message(f"📄 Mosaic Processor log saved to: {log_path}", messages, config=config)
+    logger.custom(f"Mosaic Processor log saved to: {log_path}", indent=1, emoji="📄")

@@ -3,9 +3,10 @@
 # -----------------------------------------------------------------------------
 # Purpose:             Enhances 360° images using white balance, contrast, saturation, and sharpening
 # Project:             RMI 360 Imaging Workflow Python Toolbox
-# Version:             1.0.0
+# Version:             1.1.0
 # Author:              RMI Valuation, LLC
-# Created:             2025-05-08
+# Created:             2025-05-13
+# Last Updated:        2025-05-15
 #
 # Description:
 #   Loads enhancement configuration, checks disk space, and processes all images in an OID
@@ -15,11 +16,12 @@
 #
 # File Location:        /utils/enhance_images.py
 # Called By:            tools/enhance_images_tool.py, tools/process_360_orchestrator.py
-# Int. Dependencies:    config_loader, arcpy_utils, check_disk_space, path_utils
-# Ext. Dependencies:    cv2, numpy, arcpy, csv, os, pathlib, typing, subprocess, concurrent.futures
+# Int. Dependencies:    utils/manager/config_manager, utils/shared/check_disk_space
+# Ext. Dependencies:    cv2, numpy, arcpy, csv, os, pathlib, subprocess, concurrent.futures
 #
 # Documentation:
-#   See: docs/TOOL_GUIDES.md and docs/tools/enhance_images.md
+#   See: docs_legacy/TOOL_GUIDES.md and docs_legacy/tools/enhance_images.md
+#   (Ensure these docs are current; update if needed.)
 #
 # Notes:
 #   - Automatically determines parallelism via available CPU cores unless overridden
@@ -33,13 +35,10 @@ import numpy as np
 import arcpy
 import subprocess
 from pathlib import Path
-from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utils.config_loader import resolve_config
-from utils.path_utils import get_log_path
-from utils.arcpy_utils import log_message
-from utils.check_disk_space import check_sufficient_disk_space
+from utils.manager.config_manager import ConfigManager
+from utils.shared.check_disk_space import check_sufficient_disk_space
 
 
 def compute_image_stats(img):
@@ -180,7 +179,7 @@ def copy_exif_metadata(original: Path, enhanced: Path, exiftool_path: str = "exi
         return False
 
 
-def enhance_image(img, enhance_config, contrast, full_config=None, messages=None):
+def enhance_image(img, cfg: ConfigManager, contrast, logger):
     """
     Enhances an image using configurable white balance, contrast, saturation, and sharpening.
     
@@ -190,10 +189,9 @@ def enhance_image(img, enhance_config, contrast, full_config=None, messages=None
     
     Args:
         img: Input image as a NumPy array in BGR format.
-        enhance_config: Dictionary specifying which enhancements to apply and their parameters.
+        cfg:
         contrast: Initial contrast value of the image, used for adaptive CLAHE.
-        full_config: Optional full configuration dictionary for logging context.
-        messages: Optional message handler for logging.
+        logger:
     
     Returns:
         A tuple containing:
@@ -214,31 +212,30 @@ def enhance_image(img, enhance_config, contrast, full_config=None, messages=None
         "contrast_after": None
     }
 
-    if enhance_config.get("apply_white_balance", False):
-        method = enhance_config.get("white_balance", {}).get("method", "gray_world")
+    if cfg.get("image_enhancement.white_balance.enabled", False):
+        method = cfg.get("image_enhancement.white_balance.method", "gray_world")
         img, pre_means, post_means = apply_white_balance(img, method)
         methods_applied["white_balance"] = method
         stats["pre_rgb_means"] = pre_means
         stats["post_rgb_means"] = post_means
 
-    if enhance_config.get("apply_contrast_enhancement", True):
-        clahe_cfg = enhance_config.get("clahe", {})
-        grid_size = tuple(clahe_cfg.get("tile_grid_size", [8, 8]))
-        clip_limit = clahe_cfg.get("clip_limit_low", 2.0)
-        if enhance_config.get("adaptive", False):
-            thresholds = clahe_cfg.get("contrast_thresholds", [30, 60])
+    if cfg.get("image_enhancement.clahe.enabled", True):
+        grid_size = tuple(cfg.get("image_enhancement.clahe.tile_grid_size", [8, 8]))
+        clip_limit = cfg.get("image_enhancement.clahe.clip_limit_low", 2.0)
+        if cfg.get("image_enhancement.adaptive", False):
+            thresholds = cfg.get("image_enhancement.clahe.contrast_thresholds", [30, 60])
             if contrast < thresholds[0]:
-                clip_limit = clahe_cfg.get("clip_limit_high", 2.5)
+                clip_limit = cfg.get("image_enhancement.clahe.clip_limit_high", 2.5)
         img = apply_clahe(img, clip_limit, grid_size)
         clip_limit_used = clip_limit
         methods_applied["clahe"] = True
 
-    if enhance_config.get("apply_saturation_boost", False):
-        factor = enhance_config.get("saturation_boost", {}).get("factor", 1.1)
+    if cfg.get("image_enhancement.saturation_boost.enabled", False):
+        factor = cfg.get("image_enhancement.saturation_boost.factor", 1.1)
         img = apply_saturation_boost(img, factor)
 
-    if enhance_config.get("apply_sharpening", True):
-        kernel = enhance_config.get("sharpen", {}).get("kernel", [
+    if cfg.get("image_enhancement.sharpen.enabled", True):
+        kernel = cfg.get("image_enhancement.sharpen.kernel", [
             [0, -0.5, 0],
             [-0.5, 3.0, -0.5],
             [0, -0.5, 0]
@@ -253,12 +250,11 @@ def enhance_image(img, enhance_config, contrast, full_config=None, messages=None
     stats["contrast_after"] = contrast_after
 
     # Optional brightness recovery
-    if enhance_config.get("brightness_recovery", {}):
-        threshold = enhance_config["brightness"].get("threshold", 110)
-        factor = enhance_config["brightness"].get("factor", 1.15)
+    if cfg.get("image_enhancement.brightness.enabled", False):
+        threshold = cfg.get("image_enhancement.brightness.threshold", 110)
+        factor = cfg.get("image_enhancement.brightness.factor", 1.15)
         if brightness_after < threshold:
-            log_message(f"🔧 Brightness {brightness_after:.1f} < {threshold}, applying recovery factor {factor}",
-                        messages, config=full_config)
+            logger.info(f"🔧 Brightness {brightness_after:.1f} < {threshold}, applying recovery factor {factor}", indent=2)
             img = np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
             # Recompute stats after brightening
             brightness_after = np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
@@ -269,7 +265,7 @@ def enhance_image(img, enhance_config, contrast, full_config=None, messages=None
     return img, clip_limit_used, methods_applied, stats
 
 
-def update_oid_image_paths(oid_fc: str, path_map: dict[str, str], messages=None):
+def update_oid_image_paths(oid_fc: str, path_map: dict[str, str], logger):
     """
     Updates the "ImagePath" field in an OID feature class to reference enhanced image paths.
     
@@ -281,18 +277,18 @@ def update_oid_image_paths(oid_fc: str, path_map: dict[str, str], messages=None)
             if original in path_map:
                 row[0] = path_map[original]
                 cursor.updateRow(row)
-    log_message("✅ OID ImagePath updated to reflect enhanced images.", messages)
+    logger.custom("OID ImagePath updated to reflect enhanced images.", indent=1, emoji="✅")
 
 
-def write_log(log_rows, config, messages=None):
+def write_log(log_rows, cfg, logger):
     """
     Writes a CSV log file summarizing image enhancement details.
     
     The log includes statistics such as brightness, contrast, applied enhancement methods, and output paths for each
     processed image. Handles permission errors gracefully by logging a warning if the file cannot be written.
     """
-    log_path = get_log_path("enhance_log", config)
-    log_message(f"[DEBUG] Attempting to write enhance log to: {log_path}", messages, config=config)
+    log_path = cfg.paths.get_log_file_path("enhance_log", cfg)
+    logger.debug(f"Attempting to write enhance log to: {log_path}", indent=1)
     try:
         with open(log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -303,13 +299,12 @@ def write_log(log_rows, config, messages=None):
                 "RGBMeansBeforeWB", "RGBMeansAfterWB", "OutputPath"
             ])
             writer.writerows(log_rows)
-        log_message(f"Enhancement log saved to: {log_path}", messages, config=config)
+        logger.info(f"Enhancement log saved to: {log_path}", indent=1)
     except PermissionError as e:
-        log_message(f"❌ Failed to write enhance log: {e}", messages, level="warning", config=config)
+        logger.warning(f"Failed to write enhance log: {e}", indent=1)
 
 
-def enhance_single_image(original_path: Path, enhance_config, config, output_mode, suffix, original_tag, enhanced_tag,
-                         messages):
+def enhance_single_image(original_path: Path, cfg: ConfigManager, logger):
     """
     Enhances a single image file and writes the result to disk, handling output path logic and EXIF metadata copying.
 
@@ -319,13 +314,8 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
 
     Args:
      original_path: Path to the original image file.
-     enhance_config: Dictionary containing enhancement options (e.g., white balance, CLAHE, sharpening).
-     config: Full configuration dictionary including paths and EXIF tool settings.
-     output_mode: Determines how the output path is constructed ("overwrite", "suffix", or folder tag replacement).
-     suffix: Suffix to append to the filename if output_mode is "suffix".
-     original_tag: Folder tag to replace in the path if output_mode is folder tag replacement.
-     enhanced_tag: Replacement folder tag for enhanced images.
-     messages: Optional logger or list to collect status messages.
+     cfg:
+     logger:
 
     Returns:
      A tuple containing:
@@ -337,11 +327,17 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
     """
     img = cv2.imread(str(original_path))
     if img is None:
-        return None, f"⚠️ Skipping unreadable image: {original_path}"
+        logger.warning(f"Skipping unreadable image: {original_path}", indent=2)
+        return None
+
+    output_mode = cfg.get("image_enhancement.output.mode", "directory")
+    suffix = cfg.get("image_enhancement.output.suffix", "_enh")
+    original_tag = cfg.get("image_output.folders.original")
+    enhanced_tag = cfg.get("image_output.folders.enhanced")
+
 
     brightness, contrast = compute_image_stats(img)
-    enhanced, clip_limit, methods, stats = enhance_image(img, enhance_config, contrast, full_config=config,
-                                                         messages=messages)
+    enhanced, clip_limit, methods, stats = enhance_image(img, cfg, contrast, logger)
 
     if output_mode == "overwrite":
         out_path = original_path
@@ -354,22 +350,25 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
         elif f"\\{original_tag}\\" in path_str:
             out_path = Path(path_str.replace(f"\\{original_tag}\\", f"\\{enhanced_tag}\\", 1))
         else:
-            return None, f"⚠️ Could not locate '{original_tag}' in image path: {original_path}"
+            logger.warning(f"Could not locate '{original_tag}' in image path: {original_path}", indent=2)
+            return None
         out_path.parent.mkdir(parents=True, exist_ok=True)
     else:
-        return None, f"❌ Unknown output_mode: '{output_mode}'. Expected one of: overwrite, suffix, directory"
+        logger.error(f"Unknown output_mode: '{output_mode}'. Expected one of: overwrite, suffix, directory", indent=2)
+        return None
 
     try:
         if not cv2.imwrite(str(out_path), enhanced):
-            return None, f"❌ cv2 failed to write image to {out_path}"
-        # ✅ Copy EXIF metadata from original to enhanced image
-        exiftool_path = config.get("executables", {}).get("exiftool", {}).get("exe_path", "exiftool")
+            logger.error(f"cv2 failed to write image to {out_path}", indent=2)
+            return None
+        # Copy EXIF metadata from original to enhanced image
+        exiftool_path = cfg.paths.exiftool_exe
         copied = copy_exif_metadata(original_path, out_path, exiftool_path)
         if not copied:
-            log_message(f"⚠️ Failed to copy EXIF metadata from {original_path.name}", messages, level="warning",
-                        config=config)
+            logger.warning(f"Failed to copy EXIF metadata from {original_path.name}", indent=3)
     except Exception as e:
-        return None, f"❌ Failed to write image to {out_path}: {e}"
+        logger.error(f"Failed to write image to {out_path}: {e}", indent=2)
+        return None
 
     log_row = [
         original_path.name,
@@ -388,64 +387,68 @@ def enhance_single_image(original_path: Path, enhance_config, config, output_mod
     return (str(original_path), str(out_path), log_row, not copied), None
 
 
-def enhance_images_in_oid(
-    oid_fc_path: str,
-    config: Optional[dict] = None,
-    config_file: Optional[str] = None,
-    messages=None
-):
+def process_images_in_parallel(paths, cfg, logger, max_workers, progressor):
+    log_rows = []
+    path_map = {}
+    brightness_deltas = []
+    contrast_deltas = []
+    failed_exif_copies = []
+    with ThreadPoolExecutor(max_workers) as executor:
+        futures = [
+            executor.submit(enhance_single_image, p, cfg, logger)
+            for p in paths
+        ]
+        for idx, future in enumerate(as_completed(futures), start=1):
+            result, error = future.result()
+            if error:
+                logger.warning(error)
+                continue
+            original_path_str, out_path_str, log_row, exif_failed = result
+            logger.debug(f"Enhanced image saved: {Path(out_path_str).name}", indent=2)
+            path_map[original_path_str] = out_path_str
+            log_rows.append(log_row)
+            if exif_failed:
+                failed_exif_copies.append((Path(original_path_str), Path(out_path_str)))
+            b_before = float(log_row[1])
+            c_before = float(log_row[2])
+            b_after = float(log_row[7])
+            c_after = float(log_row[8])
+            brightness_deltas.append(b_after - b_before)
+            contrast_deltas.append(c_after - c_before)
+            progressor.update(idx)
+    return path_map, log_rows, brightness_deltas, contrast_deltas, failed_exif_copies
 
+
+def enhance_images_in_oid(cfg: ConfigManager, oid_fc_path: str):
     """
     Enhances all images referenced in an ArcGIS ObjectID feature class using configurable image processing steps.
-    
     This function loads enhancement configuration, checks disk space, retrieves image paths from the specified feature
     class, and processes each image in parallel. Enhancements may include white balance, contrast adjustment, saturation
     boost, and sharpening. Enhanced images are saved according to the configured output mode, and EXIF metadata is
     copied from originals. The function updates the feature class with new image paths if not overwriting originals,
     writes a CSV log of enhancement details, and logs summary statistics.
-    
+
     Args:
+        cfg:
         oid_fc_path: Path to the ArcGIS ObjectID feature class containing image paths.
-        config: Optional configuration dictionary for enhancement parameters.
-        config_file: Optional path to a configuration file.
-        messages: Optional message handler for logging and progress reporting.
-    
+
     Returns:
         A dictionary mapping original image paths to enhanced image paths.
     """
-    config = resolve_config(
-        config=config,
-        config_file=config_file,
-        oid_fc_path=oid_fc_path,
-        messages=messages,
-        tool_name="enhance_images"
-    )
+    logger = cfg.get_logger()
+    cfg.validate(tool="enhance_images")
 
-    if not config.get("image_enhancement", {}).get("enabled", False):
-        log_message("Image enhancement is disabled in config. Skipping...", messages, config=config)
+    if not cfg.get("image_enhancement.enabled", False):
+        logger.info("Image enhancement is disabled in config. Skipping...", indent=1)
         return {}
 
-    check_sufficient_disk_space(oid_fc=oid_fc_path, config=config, buffer_ratio=1.1, verbose=True, messages=messages)
+    check_sufficient_disk_space(oid_fc_path, cfg)
+    output_mode = cfg.get("image_enhancement.output.mode", "directory")
 
-    enhance_config = config["image_enhancement"]
-    output_mode = enhance_config["output"]["mode"]
-    suffix = enhance_config["output"].get("suffix", "_enh")
-    folders = config["image_output"]["folders"]
-    original_tag = folders["original"]
-    enhanced_tag = folders["enhanced"]
+    logger.info(f"Enhancing images in OID feature class: {oid_fc_path}", indent=1)
 
     with arcpy.da.SearchCursor(oid_fc_path, ["ImagePath"]) as cursor:
         paths = [Path(row[0]) for row in cursor]
-
-    total = len(paths)
-    use_progressor = False
-
-    if messages:
-        try:
-            arcpy.SetProgressor("step", "Enhancing images...", 0, total, 1)
-            use_progressor = True
-        except (AttributeError, RuntimeError, arcpy.ExecuteError):
-            pass
 
     log_rows = []
     path_map = {}
@@ -453,71 +456,36 @@ def enhance_images_in_oid(
     contrast_deltas = []
     failed_exif_copies = []
 
-    max_workers = enhance_config.get("max_workers")
+    max_workers = cfg.get("image_enhancement.max_workers")
     if not max_workers:
         cpu_cores = os.cpu_count() or 8
         max_workers = max(4, int(cpu_cores * 0.75))
 
-    with ThreadPoolExecutor(max_workers) as executor:
-        futures = [
-            executor.submit(enhance_single_image, p, enhance_config, config, output_mode, suffix, original_tag,
-                            enhanced_tag, messages)
-            for p in paths
-        ]
-        for idx, future in enumerate(as_completed(futures), start=1):
-            result, error = future.result()
-            if error:
-                log_message(error, messages, level="warning", config=config)
-                continue
-            original_path_str, out_path_str, log_row, exif_failed = result  # still same if `log_row` just expanded
+    with cfg.get_progressor(total=len(paths), label=f"Enhancing {len(paths)} image(s)") as progressor:
+        path_map, log_rows, brightness_deltas, contrast_deltas, failed_exif_copies = process_images_in_parallel(
+            paths, cfg, logger, max_workers, progressor
+        )
 
-            log_message(f"Enhanced image saved: {Path(out_path_str).name}", messages, level="debug", config=config)
-            path_map[original_path_str] = out_path_str
-            log_rows.append(log_row)
-            if exif_failed:
-                failed_exif_copies.append((Path(original_path_str), Path(out_path_str)))
-
-            # Collect deltas for summary stats
-            b_before = float(log_row[1])
-            c_before = float(log_row[2])
-            b_after = float(log_row[7])
-            c_after = float(log_row[8])
-            brightness_deltas.append(b_after - b_before)
-            contrast_deltas.append(c_after - c_before)
-
-            if use_progressor:
-                arcpy.SetProgressorLabel(f"Enhancing {idx}/{total} ({(idx/total)*100:.1f}%)")
-                arcpy.SetProgressorPosition(idx)
-
-    if use_progressor:
-        arcpy.ResetProgressor()
-
-    write_log(log_rows, config=config, messages=messages)
+    write_log(log_rows, cfg, logger)
 
     if output_mode != "overwrite":
-        update_oid_image_paths(oid_fc_path, path_map, messages)
+        update_oid_image_paths(oid_fc_path, path_map, logger)
 
     if failed_exif_copies:
-        exiftool_path = config.get("executables", {}).get("exiftool", {}).get("exe_path", "exiftool")
+        exiftool_path = cfg.paths.exiftool_exe
         retry_successes = 0
-        log_message(f"🔄 Retrying EXIF metadata copy for {len(failed_exif_copies)} image(s)...", messages, config=config)
+        logger.custom(f"Retrying EXIF metadata copy for {len(failed_exif_copies)} image(s)...", indent=2, emoji="🔄")
         for orig, enh in failed_exif_copies:
             if copy_exif_metadata(orig, enh, exiftool_path):
                 retry_successes += 1
             else:
-                log_message(f"❌ Final EXIF copy failed: {enh.name}", messages, level="error", config=config)
-        log_message(f"✅ Retried EXIF copy success count: {retry_successes}/{len(failed_exif_copies)}", messages,
-                    config=config)
+                logger.error(f"Final EXIF copy failed: {enh.name}", indent=2)
+        logger.custom(f"Retried EXIF copy success count: {retry_successes}/{len(failed_exif_copies)}", indent=2, emoji="✅")
 
     # Summary
     if brightness_deltas:
         mean_bright_delta = np.mean(brightness_deltas)
         mean_contrast_delta = np.mean(contrast_deltas)
-        log_message(f"📊 Avg Brightness Δ: {mean_bright_delta:.2f} | Avg Contrast Δ: {mean_contrast_delta:.2f}",
-                    messages, config=config)
+        logger.custom(f"Avg Brightness Δ: {mean_bright_delta:.2f} | Avg Contrast Δ: {mean_contrast_delta:.2f}", indent=1, emoji="📊")
 
     return path_map
-
-
-if __name__ == "__main__":
-    enhance_images_in_oid("path/to/your/oid_fc")
