@@ -10,13 +10,13 @@
 #
 # Description:
 #   Recursively walks a given directory to count image files (default: .jpg) and compute their
-#   cumulative size. Formats byte totals into human-readable strings using `humanize`. Used for
+#   cumulative size. Formats byte totals into human-readable strings. Used for
 #   reporting logs and disk space estimation in enhancement and renaming steps.
 #
 # File Location:        /utils/folder_stats.py
 # Called By:            utils/check_disk_space.py, reporting
 # Int. Dependencies:    None
-# Ext. Dependencies:    os, humanize, pathlib, typing
+# Ext. Dependencies:    os, pathlib, typing
 #
 # Documentation:
 #   See: docs_legacy/UTILITIES.md
@@ -28,9 +28,18 @@
 # =============================================================================
 
 import os
-import humanize
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+
+def format_size(num_bytes: int) -> str:
+    """Return a human-readable string for a file size (e.g., 1.5 GiB)."""
+    # Using binary prefixes (like humanize.naturalsize(binary=True))
+    for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} PiB"
 
 
 def folder_stats(path: str, extensions: Optional[List[str]] = None) -> Tuple[int, str]:
@@ -61,4 +70,4 @@ def folder_stats(path: str, extensions: Optional[List[str]] = None) -> Tuple[int
             total_size += f.stat().st_size
         except OSError:
             continue  # Skip files that can't be accessed
-    return len(jpg_files), humanize.naturalsize(total_size, binary=True)
+    return len(jpg_files), format_size(total_size)

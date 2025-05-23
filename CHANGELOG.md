@@ -3,10 +3,16 @@
 *All notable changes to this project will be documented in this file.*
 
 ## [2025-05-23]
-### 🧰 RMI 360 Environment Checker
+### 🧰 RMI 360 Environment Checker and other quality-of-life changes
 #### Added
 - Added `rmi_360_env_checker.pyt` to the repository to check for required libraries in the ArcGIS Pro Python environment. This utility does not affect workflow toolbox versioning.
+- Added ArcGIS Pro license matrix (`docs_legacy/ARCGISPRO_LICENSE_REQUIREMENTS.md`) summarizing which ArcPy functions/classes require Basic, Standard, or Advanced licenses.
+- Added note to README indicating that a Standard license or above is required for Oriented Imagery tools.
 
+#### Removals/Deprecations
+- Removed `humanize` package requirement. Replaced with a native Python function in `folder_stats.py` for human-readable file size formatting. The Toolbox now runs in the base ArcGIS Pro Python environment without extra dependencies.
+
+---
 
 ## [v1.1.1] - 2025-05-22
 ### 🛠️ Bug Fix Update

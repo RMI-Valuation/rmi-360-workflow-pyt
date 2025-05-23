@@ -9,4 +9,3 @@ numpy           # Numerical computing
 jinja2          # Templating for reports or config generation
 pytest          # Unit testing
 matplotlib      # Plotting and visualization
-humanize        # Human-friendly formatting (e.g., file sizes, times)
