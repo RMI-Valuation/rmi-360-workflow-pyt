@@ -28,18 +28,24 @@
 # =============================================================================
 
 import os
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 
 def format_size(num_bytes: int) -> str:
     """Return a human-readable string for a file size (e.g., 1.5 GiB)."""
-    # Using binary prefixes (like humanize.naturalsize(binary=True))
-    for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
-        if num_bytes < 1024.0:
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024.0
-    return f"{num_bytes:.1f} PiB"
+    if num_bytes < 0:
+        raise ValueError("num_bytes must be non-negative")
+    if num_bytes < 1024:
+        return f"{num_bytes:.1f} B"
+    # Calculate the appropriate unit using logarithm base 1024
+    exponent = int(math.log(num_bytes, 1024))
+    suffixes = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB']
+    exponent = min(exponent, len(suffixes) - 1)
+    quotient = num_bytes / (1024 ** exponent)
+    return f"{quotient:.1f} {suffixes[exponent]}"
 
 
 def folder_stats(path: str, extensions: Optional[List[str]] = None) -> Tuple[int, str]:
@@ -70,4 +76,13 @@ def folder_stats(path: str, extensions: Optional[List[str]] = None) -> Tuple[int
             total_size += f.stat().st_size
         except OSError:
             continue  # Skip files that can't be accessed
-    return len(jpg_files), format_size(total_size)
+
+    def safe_stat(f):
+        try:
+            return f.stat().st_size
+        except OSError:
+            return 0
+
+    with ThreadPoolExecutor() as executor:
+        total_size_concurrent = sum(executor.map(safe_stat, jpg_files))
+    return len(jpg_files), format_size(total_size_concurrent)
